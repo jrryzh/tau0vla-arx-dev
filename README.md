@@ -18,6 +18,9 @@ Foundation Model with World-Model-Guided Test-Time Computation**.
   [Project Website](https://tau0-vla.github.io/), and
   [Hugging Face](https://huggingface.co/sii-research/tau-0-vla).
 
+- **[2026.08.19]** 📢 We plan to progressively release components of the
+  high-level policy. Please stay tuned for updates.
+
 ## Overview
 
 τ₀-VLA is a hierarchical robot foundation model for long-horizon
