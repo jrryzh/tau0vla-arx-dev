@@ -4,7 +4,7 @@
 
 ![τ₀-VLA overview](assets/overview.png)
 
-<a href="https://tau0-vla.github.io/"><img src="https://img.shields.io/badge/Project_Website-tau0_VLA-blue" height="25" alt="Project Website"></a> &nbsp; <a href="https://tau0-vla.github.io/tau0-vla.pdf"><img src="https://img.shields.io/badge/Paper-tau0_VLA-red" height="25" alt="Paper"></a> &nbsp; <a href="https://huggingface.co/sii-research/tau-0-vla"><img src="https://img.shields.io/badge/Weight-Hugging_Face-orange" height="25" alt="Model Weights"></a>
+<a href="https://tau0-vla.github.io/"><img src="https://img.shields.io/badge/Project_Website-tau0_VLA-blue" height="25" alt="Project Website"></a> &nbsp; <a href="https://arxiv.org/abs/2608.16885"><img src="https://img.shields.io/badge/Paper-tau0_VLA-red" height="25" alt="Paper"></a> &nbsp; <a href="https://huggingface.co/sii-research/tau-0-vla"><img src="https://img.shields.io/badge/Weight-Hugging_Face-orange" height="25" alt="Model Weights"></a>
 
 </div>
 
@@ -14,7 +14,7 @@ Foundation Model with World-Model-Guided Test-Time Computation**.
 ## News
 
 - **[2026.07.27]** 🚀 We release the **τ₀-VLA** model
-  [Paper](https://tau0-vla.github.io/tau0-vla.pdf),
+  [Paper](https://arxiv.org/abs/2608.16885),
   [Project Website](https://tau0-vla.github.io/), and
   [Hugging Face](https://huggingface.co/sii-research/tau-0-vla).
 
