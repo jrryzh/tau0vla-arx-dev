@@ -381,15 +381,21 @@ class ModelBuilder:
 
         if self.model_args.vlm_model_type in ["qwen3vl", "qwen2.5vl", "qwen2vl", "qwen3vl_moe"]:
             if vla_type is None:
-                # Tau0VLA handles VLM freezing internally (see below); the plain
+                # Tau0VLA configures its VLM in the VLA branch below; the plain
                 # VLM path configures the backbone directly.
                 target_model = getattr(base_model, "qwen", base_model)
                 set_training_parameters_for_qwenvl(self.model_args, target_model)
 
         if vla_type in ("tau_vla", "tau0_vla"):
-            # Tau VLA: VLM freeze is handled internally by Qwen35vlWithExpertModel
-            tune_dit = getattr(self.model_args, "tune_vla_dit", False)
+            # Tau VLA: checkpoint loading and projection/embedding resizing
+            # replace Parameter objects, undoing Qwen35vlWithExpertModel's
+            # constructor-time freeze. Set the VLM's final trainability from
+            # the tune_* flags here, after all parameter replacement is done.
             fm = getattr(base_model, "flow_matching", base_model)
+            qwenvl = getattr(fm.qwenvl_with_expert, "qwenvl", None)
+            if qwenvl is not None:
+                set_training_parameters_for_qwenvl(self.model_args, qwenvl)
+            tune_dit = getattr(self.model_args, "tune_vla_dit", False)
             for module_name in [
                 "state_proj",
                 "action_in_proj",
