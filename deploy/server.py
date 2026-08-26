@@ -9,10 +9,10 @@ del _sys, _Path
 
 import argparse
 import logging
-import pickle
+from typing import TYPE_CHECKING
 
 import numpy as np
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from deploy._bootstrap import (
     discover_checkpoint_config_modules,
@@ -20,11 +20,36 @@ from deploy._bootstrap import (
     ensure_policy_manifest,
     resolve_deploy_io,
 )
-from deploy.policy import Tau0VLAPolicy
-from deploy.warmup import _configure_inference_mode, _run_dummy_input_warmup
-from tau0_vla.data import action_slices as _action_slices
+from deploy.wire import MAX_BODY_BYTES, PayloadEncodingError, unpack_payload
+
+if TYPE_CHECKING:
+    from deploy.policy import Tau0VLAPolicy
 
 logger = logging.getLogger(__name__)
+
+
+async def _read_payload(request: Request) -> dict:
+    """Read one bounded request body and decode the safe wire format."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from error
+        if declared_size < 0:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if declared_size > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="payload body too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="payload body too large")
+        body.extend(chunk)
+    try:
+        return unpack_payload(body)
+    except PayloadEncodingError as error:
+        raise HTTPException(status_code=400, detail="invalid payload encoding") from error
 
 
 def _split_action_chunk(action: np.ndarray, slices) -> dict:
@@ -51,6 +76,8 @@ def _require_public_v1_joint_only(data_spec) -> None:
 
 
 def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
+    from tau0_vla.data import action_slices as _action_slices
+
     _require_public_v1_joint_only(policy.data_spec)
     # Embodiment-specific wire knowledge (SDK payload keys, camera aliases,
     # state channel map, SDK action column order) lives in layer 3 of an
@@ -90,7 +117,7 @@ def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
 
     @app.post("/act_lerobot_bytes")
     async def act(request: Request):
-        actions = policy.infer(adapt(pickle.loads(await request.body())))["actions"]
+        actions = policy.infer(adapt(await _read_payload(request)))["actions"]
         # Unified routes: reorder columns into the SDK's native action layout
         # (arms-then-grippers) before serialising. Component routes: identity.
         arr = deploy_io.apply_sdk_action_perm(actions, resolve_sdk_action_perm())
@@ -103,7 +130,7 @@ def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
         is a dict keyed by canonical joint-control component name
         (``arm_joint`` / ``gripper`` / ``waist`` / ...), each value a nested
         list shape ``[chunk, native_dim]``."""
-        payload = pickle.loads(await request.body())
+        payload = await _read_payload(request)
         # A mismatch between the caller's prompt and the templated one is the
         # first thing to check when a policy behaves differently over HTTP than
         # in open loop, so log both. DEBUG, not INFO: this is on the hot path.
@@ -123,6 +150,9 @@ def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
 
 
 def main() -> None:
+    from deploy.policy import Tau0VLAPolicy
+    from deploy.warmup import _configure_inference_mode, _run_dummy_input_warmup
+
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True)
     p.add_argument("--route", default=None)
