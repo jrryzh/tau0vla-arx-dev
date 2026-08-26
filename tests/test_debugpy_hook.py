@@ -8,11 +8,14 @@ from unittest import mock
 
 # ``transformers`` is only used inside ``train()``. Keep this focused unit test
 # importable in lightweight environments where the full training stack is not
-# installed.
-sys.modules.setdefault("transformers", types.ModuleType("transformers"))
-logging_stub = types.ModuleType("tau0_vla.utils.logging")
-logging_stub.setup_py_logging = mock.Mock()
-sys.modules.setdefault("tau0_vla.utils.logging", logging_stub)
+# installed, without shadowing a real installation for later test modules.
+try:
+    import transformers  # noqa: F401
+except ModuleNotFoundError:
+    sys.modules["transformers"] = types.ModuleType("transformers")
+    logging_stub = types.ModuleType("tau0_vla.utils.logging")
+    logging_stub.setup_py_logging = mock.Mock()
+    sys.modules["tau0_vla.utils.logging"] = logging_stub
 
 from tau0_vla.trainer.train import _maybe_wait_for_debugger
 
