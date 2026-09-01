@@ -45,6 +45,8 @@ class FinchResolvedRobotConfig:
     action_dim: int
     state_dim: int
     action_horizon: int
+    action_semantics: str | None
+    action_offset_frames: int | None
     cam_keys: tuple[str, ...]
     norm_stats_path: str | None
     synthetic_images: tuple[tuple[str, str], ...] = ()
@@ -155,6 +157,8 @@ class RobotConfig:
     state: Sequence[ComponentSpec] | None = None
     action: Sequence[ComponentSpec] | None = None
     action_horizon: int | None = None
+    action_semantics: str | None = None
+    action_offset_frames: int | None = None
     prompt_source: PromptSource | None = None
     source_kwargs: dict[str, Any] | None = None
     norm_stats_dir: str | None = None
@@ -821,6 +825,8 @@ class RobotConfig:
             action_dim=int(action_dim),
             state_dim=int(state_dim),
             action_horizon=int(self.action_horizon or 1),
+            action_semantics=self.action_semantics,
+            action_offset_frames=self.action_offset_frames,
             # ``cam_keys`` is the deploy-side camera identifier list, stored
             # in the same form the policy sees AFTER repack — i.e. the
             # canonical short names (``head`` / ``wrist_left`` /

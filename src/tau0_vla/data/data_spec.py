@@ -83,6 +83,8 @@ class FinchDataSpec:
     # mask (EEF slots [0:18]) for the deploy inverse. None/False for legacy routes.
     unified_registry_key: str | None = None
     unified_has_eef: bool = True
+    action_semantics: str | None = None
+    action_offset_frames: int | None = None
 
     def format_instruction(self, task_description: str) -> str:
         # Delegate to ``Prompt.format`` so named placeholders (``{instruction}``
@@ -292,6 +294,8 @@ def _build_data_spec(
         max_images_per_sample=max_images_per_sample,
         unified_registry_key=unified_registry_key,
         unified_has_eef=unified_has_eef,
+        action_semantics=exemplar.action_semantics,
+        action_offset_frames=exemplar.action_offset_frames,
     )
 
 
@@ -670,6 +674,8 @@ def _load_persisted_data_spec(
         action_field_map=action_field_map,
         unified_registry_key=payload.get("unified_registry_key"),
         unified_has_eef=bool(payload.get("unified_has_eef", True)),
+        action_semantics=payload.get("action_semantics"),
+        action_offset_frames=payload.get("action_offset_frames"),
     )
 
 
@@ -1830,12 +1836,15 @@ def _validate_homogeneous_data_spec(resolved: list[Any]) -> None:
             or other.action_dim != exemplar.action_dim
             or other.state_dim != exemplar.state_dim
             or other.action_horizon != exemplar.action_horizon
+            or other.action_semantics != exemplar.action_semantics
+            or other.action_offset_frames != exemplar.action_offset_frames
             or tuple(other.cam_keys) != tuple(exemplar.cam_keys)
             or _resolve_target_size(other) != _resolve_target_size(exemplar)
         ):
             raise ValueError(
                 "Resolved Finch configs do not share a single Finch data spec. "
-                "tau-0-vla currently requires homogeneous forward keys, dims, horizon, cameras, and image size."
+                "tau-0-vla currently requires homogeneous forward keys, dims, horizon, "
+                "action semantics, action offset, cameras, and image size."
             )
 
 
