@@ -174,5 +174,8 @@ results*
 outputs_profile_run/*
 # local-only: full-data pretrain mix configs (kept out of the shared repo)
 configs/pretrain_final_4w/
-# local data symlinks
-/data/
+# Local data stays ignored except for the small, reviewed ARX LeRobot example.
+/data/*
+!/data/arx_pickplace/
+/data/arx_pickplace/*
+!/data/arx_pickplace/lerobot_v3_30fps_state_t_plus_1/

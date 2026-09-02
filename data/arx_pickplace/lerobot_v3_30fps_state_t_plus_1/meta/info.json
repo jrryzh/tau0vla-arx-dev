@@ -1,0 +1,234 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "ARX_LIFT2s",
+    "total_episodes": 5,
+    "total_frames": 1868,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 500,
+    "fps": 30,
+    "splits": {
+        "train": "0:5"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "features": {
+        "observation.images.head": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.images.left_wrist": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.images.right_wrist": {
+            "dtype": "video",
+            "shape": [
+                480,
+                640,
+                3
+            ],
+            "names": [
+                "height",
+                "width",
+                "channels"
+            ],
+            "info": {
+                "video.height": 480,
+                "video.width": 640,
+                "video.codec": "av1",
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": false,
+                "video.fps": 30,
+                "video.channels": 3,
+                "has_audio": false
+            }
+        },
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": [
+                "left_j0",
+                "left_j1",
+                "left_j2",
+                "left_j3",
+                "left_j4",
+                "left_j5",
+                "left_gripper",
+                "right_j0",
+                "right_j1",
+                "right_j2",
+                "right_j3",
+                "right_j4",
+                "right_j5",
+                "right_gripper"
+            ],
+            "field_descriptions": {
+                "state/joint/position": {
+                    "description": "dual-arm joint positions in radians",
+                    "dimensions": 12,
+                    "indices": [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5,
+                        7,
+                        8,
+                        9,
+                        10,
+                        11,
+                        12
+                    ]
+                },
+                "state/left_effector/position": {
+                    "description": "raw left gripper position",
+                    "dimensions": 1,
+                    "indices": [
+                        6
+                    ]
+                },
+                "state/right_effector/position": {
+                    "description": "raw right gripper position",
+                    "dimensions": 1,
+                    "indices": [
+                        13
+                    ]
+                }
+            }
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": [
+                "left_j0",
+                "left_j1",
+                "left_j2",
+                "left_j3",
+                "left_j4",
+                "left_j5",
+                "left_gripper",
+                "right_j0",
+                "right_j1",
+                "right_j2",
+                "right_j3",
+                "right_j4",
+                "right_j5",
+                "right_gripper"
+            ],
+            "field_descriptions": {
+                "action/joint/position": {
+                    "description": "dual-arm target joint positions in radians",
+                    "dimensions": 12,
+                    "indices": [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5,
+                        7,
+                        8,
+                        9,
+                        10,
+                        11,
+                        12
+                    ]
+                },
+                "action/left_effector/position": {
+                    "description": "raw left gripper target",
+                    "dimensions": 1,
+                    "indices": [
+                        6
+                    ]
+                },
+                "action/right_effector/position": {
+                    "description": "raw right gripper target",
+                    "dimensions": 1,
+                    "indices": [
+                        13
+                    ]
+                }
+            }
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}

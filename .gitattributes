@@ -1,2 +1,4 @@
 example_data/**/*.mp4 binary
 example_data/**/*.parquet binary
+data/arx_pickplace/lerobot_v3_30fps_state_t_plus_1/videos/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
+data/arx_pickplace/lerobot_v3_30fps_state_t_plus_1/**/*.parquet binary

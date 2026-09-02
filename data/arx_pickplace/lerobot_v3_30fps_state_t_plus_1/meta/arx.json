@@ -1,0 +1,176 @@
+{
+  "source_format": "official_ros2_lift_play_hdf5",
+  "lerobot_version": "0.4.1",
+  "compatible_lerobot_api": "0.4.x",
+  "lerobot_format": "v3",
+  "source_fps": 60,
+  "fps": 30,
+  "temporal_stride": 2,
+  "downsample_method": "uniform_stride_no_interpolation",
+  "timestamps_available": false,
+  "action_dim": 14,
+  "action_semantics": "state_t_plus_1",
+  "action_offset_frames": 1,
+  "joint_names": [
+    "left_j0",
+    "left_j1",
+    "left_j2",
+    "left_j3",
+    "left_j4",
+    "left_j5",
+    "left_gripper",
+    "right_j0",
+    "right_j1",
+    "right_j2",
+    "right_j3",
+    "right_j4",
+    "right_j5",
+    "right_gripper"
+  ],
+  "camera_names": [
+    "head",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "task": "Pick up the object and place it into the bowl.",
+  "total_episodes": 5,
+  "total_source_frames": 3744,
+  "total_frames": 1868,
+  "episodes": [
+    {
+      "file": "episode_4.hdf5",
+      "sha256": "c2b3a357fd3c9d9e2525325cfe6b66d7182364a5fe21001999e3395704a802d6",
+      "source_action_semantics": "",
+      "height_command": 15.04,
+      "source_task": "",
+      "image_shapes": {
+        "head": [
+          480,
+          640,
+          3
+        ],
+        "left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "base_max_abs": 0.0,
+      "source_frames": 800,
+      "output_frames": 399
+    },
+    {
+      "file": "episode_5.hdf5",
+      "sha256": "5031cc5b45a35e35de2e5c73c06c565dee80c053bf4a5ec989f92c08d762095c",
+      "source_action_semantics": "",
+      "height_command": 15.04,
+      "source_task": "",
+      "image_shapes": {
+        "head": [
+          480,
+          640,
+          3
+        ],
+        "left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "base_max_abs": 0.0,
+      "source_frames": 800,
+      "output_frames": 399
+    },
+    {
+      "file": "episode_6.hdf5",
+      "sha256": "1e3a5647623882a9fa0f25b8f6b59d13bbd1dd43cd5a7985fb3377da02be91c6",
+      "source_action_semantics": "",
+      "height_command": 15.04,
+      "source_task": "",
+      "image_shapes": {
+        "head": [
+          480,
+          640,
+          3
+        ],
+        "left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "base_max_abs": 0.0,
+      "source_frames": 800,
+      "output_frames": 399
+    },
+    {
+      "file": "episode_7.hdf5",
+      "sha256": "6510cc4caa9798d362ddb418884ccdd639a5756f3202071919aca38da0903fc6",
+      "source_action_semantics": "",
+      "height_command": 15.04,
+      "source_task": "",
+      "image_shapes": {
+        "head": [
+          480,
+          640,
+          3
+        ],
+        "left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "base_max_abs": 0.0,
+      "source_frames": 601,
+      "output_frames": 300
+    },
+    {
+      "file": "episode_8.hdf5",
+      "sha256": "34b078da502ca94df92c43e85eb6cf895b2231c8a12e277ffc7711b482f3065a",
+      "source_action_semantics": "",
+      "height_command": 15.04,
+      "source_task": "",
+      "image_shapes": {
+        "head": [
+          480,
+          640,
+          3
+        ],
+        "left_wrist": [
+          480,
+          640,
+          3
+        ],
+        "right_wrist": [
+          480,
+          640,
+          3
+        ]
+      },
+      "base_max_abs": 0.0,
+      "source_frames": 743,
+      "output_frames": 371
+    }
+  ]
+}
