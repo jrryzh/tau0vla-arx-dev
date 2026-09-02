@@ -72,10 +72,27 @@ def canonical_obs_from_raw(raw: Dict[str, Any], config) -> Dict[str, Any]:
     inside ``policy.infer`` applies prompt_template / image resize / state
     pipeline exactly once."""
     repacked = config._repack_raw_sample(raw)
+
+    def _as_numpy(value: Any) -> np.ndarray:
+        """Normalize LeRobot tensor/array values for the safe NPZ wire format."""
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            value = value.numpy()
+        return np.asarray(value)
+
+    def _image_as_hwc(image: Any) -> np.ndarray:
+        array = _as_numpy(image)
+        if array.ndim == 3 and array.shape[0] in (1, 3) and array.shape[-1] not in (1, 3):
+            array = np.moveaxis(array, 0, -1)
+        return array
+
     return {
         "prompt": repacked["prompt"],
-        "images": repacked["images"],
-        "state":  np.asarray(repacked["_state_raw"], dtype=np.float32).reshape(-1),
+        "images": {key: _image_as_hwc(image) for key, image in repacked["images"].items()},
+        "state":  _as_numpy(repacked["_state_raw"]).astype(np.float32, copy=False).reshape(-1),
         "meta":   {},
     }
 
