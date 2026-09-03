@@ -158,7 +158,18 @@ def require_policy_manifest(path: str | Path) -> dict[str, Any]:
     return manifest
 
 
-def load_checkpoint_spec(path: str | Path, *, route: str | None = None) -> CheckpointSpec:
+def load_checkpoint_spec(
+    path: str | Path,
+    *,
+    route: str | None = None,
+    resolve_finch_config: bool = True,
+) -> CheckpointSpec:
+    """Load checkpoint identity and optionally reconstruct its dataset config.
+
+    Serving uses the persisted Data Spec and passes ``resolve_finch_config=False``
+    so a deployment does not require the training dataset to be mounted. Offline
+    evaluation keeps the default because it needs the live config and dataset.
+    """
     checkpoint_dir = Path(path)
     manifest = require_policy_manifest(checkpoint_dir)
     checkpoint_config_name = str(manifest.get("checkpoint_config_name") or manifest.get("train_config_name"))
@@ -168,7 +179,7 @@ def load_checkpoint_spec(path: str | Path, *, route: str | None = None) -> Check
     config_modules = [str(value) for value in manifest.get("config_modules", []) if value is not None]
     selected_route = resolve_selected_route(route, list(routes))
     finch_config = None
-    if finch_config_name is not None:
+    if finch_config_name is not None and resolve_finch_config:
         finch_config = load_finch_config(str(finch_config_name), route=selected_route, config_modules=config_modules)
     model_action_dim = manifest.get("model_action_dim")
     # Prefer what the manifest recorded; derive it from the resolved config for

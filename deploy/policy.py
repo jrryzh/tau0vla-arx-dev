@@ -68,7 +68,10 @@ class Tau0VLAPolicy:
         (and for old ckpts, ``ensure_policy_manifest``) first."""
         ckpt_path = Path(ckpt_dir).resolve()
 
-        spec = load_checkpoint_spec(ckpt_path, route=route)
+        # The saved Data Spec is the complete serving contract. Do not
+        # instantiate the training Robot Config here: ARX configs validate the
+        # source dataset, which is deliberately absent from a model server.
+        spec = load_checkpoint_spec(ckpt_path, route=route, resolve_finch_config=False)
         data_spec = load_data_spec(ckpt_path, route=spec.route)
 
         model_args, rebuilt_data_args, training_args, _ = load_resolved_args(ckpt_path)

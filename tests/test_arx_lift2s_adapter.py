@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -20,6 +21,7 @@ from tau0_vla.adapters.arx_lift2s.deploy_io import (
     restore_native_action,
 )
 from tau0_vla.data.modalities import ArmJoint, Gripper
+from tau0_vla.data.checkpoint_spec import load_checkpoint_spec
 
 
 def _config() -> ArxLift2sUnified:
@@ -153,6 +155,30 @@ def _valid_metadata(root: Path) -> None:
 
 
 class ArxContractTest(unittest.TestCase):
+    def test_serving_checkpoint_spec_does_not_resolve_training_dataset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "policy_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "policy_type": "tau0_vla",
+                        "train_config_name": "arx_train",
+                        "checkpoint_config_name": "arx_train",
+                        "finch_config_name": "arx_lift2s_pickplace_ft",
+                        "routes": ["arx_lift2s_pickplace_ft"],
+                        "adapter_module": "tau0_vla.adapters.arx_lift2s",
+                    }
+                )
+            )
+            with mock.patch(
+                "tau0_vla.data.checkpoint_spec.load_finch_config",
+                side_effect=AssertionError("training dataset config must not be loaded"),
+            ):
+                spec = load_checkpoint_spec(root, resolve_finch_config=False)
+            self.assertIsNone(spec.finch_config)
+            self.assertEqual(spec.adapter_module, "tau0_vla.adapters.arx_lift2s")
+
     def test_dataset_contract_accepts_exact_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
