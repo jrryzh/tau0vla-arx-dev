@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -23,6 +24,7 @@ ACTION_DIM = 14
 ACTION_HORIZON = 30
 ACTION_SEMANTICS = "state_t_plus_1"
 MAX_JPEG_BYTES = 8 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class SessionRequest(BaseModel):
@@ -118,6 +120,7 @@ def build_router(
         session = _Session(session_id=uuid.uuid4().hex, task_instruction=instruction)
         with lock:
             active = session
+        logger.info("ARX session created: session=%s client=%s", session.session_id, request.client_name)
         return {
             "session_id": session.session_id,
             "protocol_version": PROTOCOL_VERSION,
@@ -184,6 +187,14 @@ def build_router(
             if active is not session:
                 raise HTTPException(status_code=409, detail="session changed during inference")
             session.last_request_id = request_id
+        logger.info(
+            "ARX action chunk: session=%s request=%d sample=%d inference_ms=%.1f shape=%s",
+            session_id,
+            request_id,
+            sample_monotonic_ns,
+            inference_ms,
+            tuple(actions.shape),
+        )
         return {
             "protocol_version": PROTOCOL_VERSION,
             "session_id": session_id,
