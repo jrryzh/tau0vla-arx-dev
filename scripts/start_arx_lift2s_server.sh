@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_path="${repo_root}/scripts/$(basename "${BASH_SOURCE[0]}")"
 : "${MODEL_DIR:=/home/xiangchengliu/models/tau0vla-arx-pickplace-h200-step10000}"
 : "${PYTHON_BIN:=/home/xiangchengliu/anaconda3/envs/tau0-vla/bin/python}"
 : "${BIND_HOST:=192.168.31.83}"
@@ -33,6 +34,7 @@ if [[ "${1:-}" == "--foreground" ]]; then
     --model-id "${MODEL_ID}" \
     --checkpoint-sha256 "${CHECKPOINT_SHA256}" \
     --allow-client-ip "${ARX_CLIENT_IP}" \
+    --allow-client-ip "${BIND_HOST}" \
     --allow-client-ip 127.0.0.1 \
     --infer-mode optim \
     --warmup-steps 3
@@ -46,5 +48,5 @@ fi
 
 mkdir -p "${LOG_DIR}"
 export MODEL_DIR PYTHON_BIN BIND_HOST PORT ARX_CLIENT_IP MODEL_ID TMUX_SESSION LOG_DIR CHECKPOINT_SHA256
-tmux new-session -d -s "${TMUX_SESSION}" "$(printf '%q' "$0") --foreground"
+tmux new-session -d -s "${TMUX_SESSION}" "$(printf '%q' "${script_path}") --foreground"
 echo "Started ${TMUX_SESSION}; attach with: tmux attach -t ${TMUX_SESSION}"
