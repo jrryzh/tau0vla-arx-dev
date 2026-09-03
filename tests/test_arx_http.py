@@ -5,9 +5,9 @@ import unittest
 from io import BytesIO
 from types import SimpleNamespace
 
+import httpx
 import numpy as np
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from PIL import Image
 
 from deploy.arx_lift2s_http import PROTOCOL_VERSION, build_router
@@ -37,8 +37,8 @@ class _Policy:
         return {"actions": np.repeat(state[None], 30, axis=0)}
 
 
-class ArxHttpTest(unittest.TestCase):
-    def setUp(self):
+class ArxHttpTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
         self.policy = _Policy()
         app = FastAPI()
         app.include_router(
@@ -49,13 +49,16 @@ class ArxHttpTest(unittest.TestCase):
                 checkpoint_sha256="abc123",
             )
         )
-        self.client = TestClient(app)
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
-    def test_contract_session_and_ordered_action_chunk(self):
-        contract = self.client.get("/api/v1/arx-lift2s/policy-contract")
+    async def asyncTearDown(self):
+        await self.client.aclose()
+
+    async def test_contract_session_and_ordered_action_chunk(self):
+        contract = await self.client.get("/api/v1/arx-lift2s/policy-contract")
         self.assertEqual(contract.status_code, 200)
         self.assertEqual(contract.json()["action_horizon"], 30)
-        session = self.client.post(
+        session = await self.client.post(
             "/api/v1/arx-lift2s/sessions",
             json={"protocol_version": PROTOCOL_VERSION, "task_instruction": "pick"},
         )
@@ -70,7 +73,7 @@ class ArxHttpTest(unittest.TestCase):
         files = {name: (f"{name}.jpg", _jpeg(index), "image/jpeg") for index, name in enumerate(
             ("head", "left_wrist", "right_wrist"), start=1
         )}
-        response = self.client.post(
+        response = await self.client.post(
             f"/api/v1/arx-lift2s/sessions/{session_id}/action-chunks",
             data={"metadata": json.dumps(metadata)},
             files=files,
@@ -79,7 +82,7 @@ class ArxHttpTest(unittest.TestCase):
         self.assertEqual(np.asarray(response.json()["actions"]).shape, (30, 14))
         self.assertEqual(self.policy.last_payload["images"]["head"].shape, (12, 16, 3))
 
-        duplicate = self.client.post(
+        duplicate = await self.client.post(
             f"/api/v1/arx-lift2s/sessions/{session_id}/action-chunks",
             data={"metadata": json.dumps(metadata)},
             files={name: (f"{name}.jpg", _jpeg(1), "image/jpeg") for name in (
@@ -88,12 +91,12 @@ class ArxHttpTest(unittest.TestCase):
         )
         self.assertEqual(duplicate.status_code, 409)
 
-    def test_rejects_invalid_state_and_old_session(self):
-        first = self.client.post(
+    async def test_rejects_invalid_state_and_old_session(self):
+        first = (await self.client.post(
             "/api/v1/arx-lift2s/sessions",
             json={"protocol_version": PROTOCOL_VERSION, "task_instruction": "pick"},
-        ).json()["session_id"]
-        self.client.post(
+        )).json()["session_id"]
+        await self.client.post(
             "/api/v1/arx-lift2s/sessions",
             json={"protocol_version": PROTOCOL_VERSION, "task_instruction": "pick again"},
         )
@@ -103,7 +106,7 @@ class ArxHttpTest(unittest.TestCase):
             "sample_monotonic_ns": 123,
             "observation_state": [0.0] * 13,
         }
-        response = self.client.post(
+        response = await self.client.post(
             f"/api/v1/arx-lift2s/sessions/{first}/action-chunks",
             data={"metadata": json.dumps(metadata)},
             files={name: (f"{name}.jpg", _jpeg(1), "image/jpeg") for name in (
