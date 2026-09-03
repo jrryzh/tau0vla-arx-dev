@@ -9,10 +9,12 @@ del _sys, _Path
 
 import argparse
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from deploy._bootstrap import (
     discover_checkpoint_config_modules,
@@ -75,7 +77,14 @@ def _require_public_v1_joint_only(data_spec) -> None:
         )
 
 
-def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
+def build_app(
+    policy: Tau0VLAPolicy,
+    *,
+    adapter: str | None = None,
+    model_id: str | None = None,
+    checkpoint_sha256: str | None = None,
+    allowed_client_ips: tuple[str, ...] = (),
+) -> FastAPI:
     from tau0_vla.data import action_slices as _action_slices
 
     _require_public_v1_joint_only(policy.data_spec)
@@ -113,7 +122,18 @@ def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
                             sdk_action_perm)
         return sdk_action_perm
 
+    resolved_model_id = model_id or f"tau0vla:{policy.data_spec.finch_config_name}"
     app = FastAPI()
+
+    if allowed_client_ips:
+        allowed = frozenset(allowed_client_ips)
+
+        @app.middleware("http")
+        async def restrict_client_ip(request: Request, call_next):
+            client_ip = request.client.host if request.client is not None else ""
+            if client_ip not in allowed:
+                return JSONResponse(status_code=403, content={"detail": "client IP is not allowed"})
+            return await call_next(request)
 
     @app.post("/act_lerobot_bytes")
     async def act(request: Request):
@@ -144,7 +164,27 @@ def build_app(policy: Tau0VLAPolicy, *, adapter: str | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "route": policy.data_spec.finch_config_name}
+        return {
+            "status": "ok",
+            "ready": True,
+            "route": policy.data_spec.finch_config_name,
+            "model_id": resolved_model_id,
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+
+    if getattr(policy.data_spec, "robot_name", None) == "arx_lift2s_unified":
+        from deploy.arx_lift2s_http import build_router
+
+        app.include_router(
+            build_router(
+                policy=policy,
+                native_action=lambda actions: deploy_io.apply_sdk_action_perm(
+                    actions, resolve_sdk_action_perm()
+                ),
+                model_id=resolved_model_id,
+                checkpoint_sha256=checkpoint_sha256,
+            )
+        )
 
     return app
 
@@ -170,6 +210,12 @@ def main() -> None:
                    help="Static prefix length for optim mode; 0 keeps checkpoint value or uses 256.")
     p.add_argument("--warmup-steps", type=int, default=3,
                    help="Dummy deploy-path warmup calls before serving; set 0 to disable.")
+    p.add_argument("--model-id", default=None,
+                   help="Stable identifier returned to ARX clients; defaults to the checkpoint directory name.")
+    p.add_argument("--checkpoint-sha256", default=None,
+                   help="Verified model.safetensors SHA-256 reported by health and policy-contract.")
+    p.add_argument("--allow-client-ip", action="append", default=[],
+                   help="Allow one source IP. Repeat for ARX1 and localhost; omit to disable filtering.")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -188,7 +234,17 @@ def main() -> None:
     _run_dummy_input_warmup(policy, warmup_steps=args.warmup_steps)
 
     import uvicorn
-    uvicorn.run(build_app(policy, adapter=args.adapter), host=args.host, port=args.port)
+    uvicorn.run(
+        build_app(
+            policy,
+            adapter=args.adapter,
+            model_id=args.model_id or f"tau0vla:{Path(args.model).resolve().name}",
+            checkpoint_sha256=args.checkpoint_sha256,
+            allowed_client_ips=tuple(args.allow_client_ip),
+        ),
+        host=args.host,
+        port=args.port,
+    )
 
 
 if __name__ == "__main__":

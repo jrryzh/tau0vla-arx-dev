@@ -46,6 +46,7 @@ causal-conv1d==1.7.0           # Qwen3.5 linear-attention convolution fast path
 # --- serving (deploy/) ---
 fastapi==0.101.0
 uvicorn==0.27.1
+python-multipart>=0.0.9,<1
 
 # --- open-loop plots (deploy/openloop.py --out-dir) ---
 matplotlib==3.10.8             # imported lazily; --no-plot runs never need it

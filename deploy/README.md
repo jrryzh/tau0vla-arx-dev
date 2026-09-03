@@ -55,6 +55,19 @@ The server exposes:
   action chunk;
 - `GET /health` — health check.
 
+For an ARX LIFT2s checkpoint the same process also exposes a versioned robot
+control contract. It creates one active session at a time and returns native
+30-step, 14D joint-position chunks:
+
+- `GET /api/v1/arx-lift2s/policy-contract`
+- `POST /api/v1/arx-lift2s/sessions`
+- `POST /api/v1/arx-lift2s/sessions/{session_id}/action-chunks`
+
+The action-chunk endpoint accepts JSON metadata plus `head`, `left_wrist`, and
+`right_wrist` JPEG multipart fields. It validates monotonically increasing
+request IDs and echoes the request/session identity. This robot-facing API is
+additive; `/act` and `/act_lerobot_bytes` keep their existing contracts.
+
 Both POST request bodies are `.npz` bundles produced by
 `deploy.wire.pack_payload`: boolean, integer, and floating-point numpy arrays
 travel as named entries and the nested dictionary/list structure travels in a

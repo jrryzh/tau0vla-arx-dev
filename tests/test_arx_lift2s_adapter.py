@@ -13,7 +13,12 @@ from tau0_vla.adapters.arx_lift2s import (
     ArxLift2sUnified,
     validate_dataset_contract,
 )
-from tau0_vla.adapters.arx_lift2s.deploy_io import restore_native_action
+from tau0_vla.adapters.arx_lift2s.deploy_io import (
+    build_native_action_perm,
+    build_payload_adapter,
+    state_dim_from_field_descriptions,
+    restore_native_action,
+)
 from tau0_vla.data.modalities import ArmJoint, Gripper
 
 
@@ -29,6 +34,37 @@ def _config() -> ArxLift2sUnified:
 
 
 class ArxLayoutTest(unittest.TestCase):
+    def test_live_payload_and_action_order(self):
+        state_fd = {
+            "state/joint/position": {"indices": [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]},
+            "state/left_effector/position": {"indices": [6]},
+            "state/right_effector/position": {"indices": [13]},
+        }
+        self.assertEqual(state_dim_from_field_descriptions(state_fd), 14)
+        adapter = build_payload_adapter(
+            cam_keys=("head", "left_wrist", "right_wrist"),
+            state_fd=state_fd,
+            state_dim=14,
+        )
+        image = np.zeros((8, 9, 3), dtype=np.uint8)
+        payload = adapter(
+            {
+                "prompt": "pick",
+                "state": np.arange(14, dtype=np.float32),
+                "images": {name: image for name in ("head", "left_wrist", "right_wrist")},
+            }
+        )
+        np.testing.assert_array_equal(payload["state"], np.arange(14, dtype=np.float32))
+        self.assertEqual(tuple(payload["images"]), ("head", "left_wrist", "right_wrist"))
+
+        slices = [
+            ("left_gripper", 0, 1),
+            ("right_gripper", 1, 1),
+            ("left_arm", 2, 6),
+            ("right_arm", 8, 6),
+        ]
+        self.assertEqual(build_native_action_perm(slices), [2, 3, 4, 5, 6, 7, 0, 8, 9, 10, 11, 12, 13, 1])
+
     def test_native_14d_scatter_relative_action_and_masks(self):
         state = np.arange(14, dtype=np.float32)
         action = np.stack([state + 10, state + 20])
