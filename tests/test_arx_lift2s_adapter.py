@@ -22,6 +22,7 @@ from tau0_vla.adapters.arx_lift2s.deploy_io import (
 )
 from tau0_vla.data.modalities import ArmJoint, Gripper
 from tau0_vla.data.checkpoint_spec import load_checkpoint_spec
+from tau0_vla.data.data_spec import build_unified_state_encoder
 
 
 def _config() -> ArxLift2sUnified:
@@ -178,6 +179,43 @@ class ArxContractTest(unittest.TestCase):
                 spec = load_checkpoint_spec(root, resolve_finch_config=False)
             self.assertIsNone(spec.finch_config)
             self.assertEqual(spec.adapter_module, "tau0_vla.adapters.arx_lift2s")
+
+    def test_serving_state_encoder_uses_saved_contract_without_dataset(self):
+        stats = {
+            "mean": [0.0] * 40,
+            "std": [1.0] * 40,
+            "q01": [-1.0] * 40,
+            "q99": [1.0] * 40,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            stats_path = Path(directory) / "norm_stats.json"
+            stats_path.write_text(
+                json.dumps(
+                    {
+                        "format_version": 2,
+                        "norm_stats": {"state": stats, "action": stats},
+                        "per_embodiment": {"arx_lift2s_14": {"state": stats, "action": stats}},
+                        "config_summary": {},
+                    }
+                )
+            )
+            data_spec = SimpleNamespace(
+                finch_config_name="arx_lift2s_pickplace_ft",
+                artifacts_dir=directory,
+                config_modules=(),
+                unified_registry_key="arx_lift2s_14",
+                unified_has_eef=False,
+                norm_stats_path=str(stats_path),
+                action_dim=40,
+            )
+            with mock.patch(
+                "tau0_vla.data.data_spec.get_config",
+                side_effect=AssertionError("training dataset config must not be loaded"),
+            ):
+                encoded = build_unified_state_encoder(data_spec)(np.arange(14, dtype=np.float32))
+        self.assertEqual(encoded["state"].shape, (40,))
+        self.assertEqual(encoded["state_abs"].shape, (40,))
+        self.assertEqual(int(encoded["state_mask"].sum()), 14)
 
     def test_dataset_contract_accepts_exact_schema(self):
         with tempfile.TemporaryDirectory() as directory:

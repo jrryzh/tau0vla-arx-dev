@@ -1145,6 +1145,7 @@ def _build_unified_assembler(
     relative_action: bool = True,
     disable_normalization: bool = False,
     return_all_norm_forms: bool = False,
+    resolve_config: bool = True,
 ):
     """Construct the training-time ``UnifiedAssembler`` for a unified-40D route
     from its resolved config (EEF provider / format / single-arm) + the ckpt's
@@ -1167,13 +1168,13 @@ def _build_unified_assembler(
     if key is None:
         raise ValueError(f"{caller} called on a non-unified data_spec")
 
-    from tau0_vla.data.robots.unified import UnifiedAssembler
+    from tau0_vla.data.robots.unified import UnifiedAssembler, get_registry_entry
     from tau0_vla.data.stats import load_file_with_per_embodiment
 
     if data_spec.config_modules:
         discover_config_modules(module_names=list(data_spec.config_modules))
     config = None
-    if data_spec.finch_config_name:
+    if resolve_config and data_spec.finch_config_name:
         try:
             config = get_config(data_spec.finch_config_name)
         except KeyError:
@@ -1191,10 +1192,11 @@ def _build_unified_assembler(
         eef_format = getattr(config, "_eef_format", "euler")
         is_single_arm = getattr(config, "_is_single_arm", False)
     else:
+        entry = get_registry_entry(key)
         eef_state_col = None
         has_eef_state = has_eef_action = bool(data_spec.unified_has_eef)
-        eef_format = "euler"
-        is_single_arm = False
+        eef_format = str(entry.get("eef_format") or "euler")
+        is_single_arm = bool(entry.get("is_single_arm", False))
 
     if has_eef_state and eef_provider is None:
         raise NotImplementedError(
@@ -1268,7 +1270,13 @@ def build_unified_state_encoder(data_spec: "FinchDataSpec"):
     # ``return_all_norm_forms=True`` so ``extras['state']['raw']`` gives back the
     # absolute (pre-normalize) scattered state the restore inverse needs.
     assembler, _config = _build_unified_assembler(
-        data_spec, caller="build_unified_state_encoder", return_all_norm_forms=True,
+        data_spec,
+        caller="build_unified_state_encoder",
+        return_all_norm_forms=True,
+        # Online serving is fully defined by the saved Data Spec, registry and
+        # norm stats. Reconstructing the training config here would remount or
+        # validate its source dataset on the model server.
+        resolve_config=False,
     )
     entry = get_registry_entry(key)
     dummy_action = np.zeros(int(entry.get("action_dim") or data_spec.action_dim), dtype=np.float32)
