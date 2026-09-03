@@ -1,7 +1,4 @@
-"""Offline-only action restoration for ARX LIFT2s.
-
-This module intentionally defines no SDK payload or HTTP adapter.
-"""
+"""Action restoration for the ARX LIFT2s state-as-action route."""
 
 from __future__ import annotations
 

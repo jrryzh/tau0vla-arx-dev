@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Convert official ROS2_LIFT_Play HDF5 episodes to LeRobot 0.4.x/v3.
 
-The default fallback contract writes action(t)=qpos(t+1) at the output FPS.
-It never treats the delivered same-frame qpos field as a true command action.
+The default state-as-action contract writes action(t)=qpos(t+1) at the output
+FPS. Source commands remain available through the explicitly labelled
+``joint_position_command`` mode.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ JOINT_NAMES = tuple(
     + ["right_gripper"]
 )
 ACTION_DIM = 14
-FALLBACK_ACTION_SEMANTICS = "state_t_plus_1"
+STATE_AS_ACTION_SEMANTICS = "state_t_plus_1"
 SOURCE_ACTION_SEMANTICS = "joint_position_command"
 
 
@@ -121,7 +122,10 @@ def validate_selection(
 ) -> dict:
     stride = temporal_stride(source_fps, fps)
     if not task.strip():
-        raise ValueError("--task is required because official HDF5 task is empty")
+        raise ValueError(
+            "--task must be non-empty; source HDF5 task IDs are retained only as "
+            "provenance and are not used as training instructions"
+        )
     episodes = [inspect_episode(path) for path in paths]
     if action_mode == "source":
         invalid = [
@@ -135,7 +139,7 @@ def validate_selection(
                 f"{SOURCE_ACTION_SEMANTICS!r}; invalid episodes: {invalid}"
             )
     action_semantics = (
-        FALLBACK_ACTION_SEMANTICS
+        STATE_AS_ACTION_SEMANTICS
         if action_mode == "state_t_plus_1"
         else SOURCE_ACTION_SEMANTICS
     )
@@ -307,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         "--action-mode",
         choices=("state_t_plus_1", "source"),
         default="state_t_plus_1",
-        help="fallback next-state action, or an explicitly labelled true source command",
+        help="next-state-as-action target, or an explicitly labelled source command",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--repo-id")

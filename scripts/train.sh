@@ -24,6 +24,9 @@ export AUTO_RESUME="${AUTO_RESUME:-1}"
 # [LONG_SAMPLE] log line — the point is to notice an over-long prompt before it
 # hits the model_max_length truncation.
 export VLA_LOG_LONG_SAMPLE_LEN="${VLA_LOG_LONG_SAMPLE_LEN:-1600}"
+# Invoke torchrun as a Python module so relocated virtual environments do not
+# depend on the absolute interpreter path embedded in the torchrun shebang.
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Offline by default. On a machine without an outbound route, every Hub lookup
 # otherwise blocks for 120-300s per task before giving up. Set these to 0 when
@@ -123,7 +126,7 @@ if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
 fi
 
 # === 4. Go ===
-torchrun \
+"$PYTHON_BIN" -m torch.distributed.run \
     --nnodes="$NNODES" \
     --node-rank="$NODE_RANK" \
     --nproc-per-node="$NPROC_PER_NODE" \

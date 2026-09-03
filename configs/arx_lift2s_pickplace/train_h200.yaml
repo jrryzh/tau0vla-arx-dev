@@ -1,18 +1,15 @@
 experiment:
-  run_name: arx_lift2s_pickplace_ft
+  run_name: arx_lift2s_pickplace_h200_formal
   project_name: tau-0-vla
-  notes: "ARX LIFT2s 14D state(t+1)-as-action finetuning."
+  notes: "ARX LIFT2s full-parameter 16xH200 formal training; global batch 128."
 
 model_args:
   model_name_or_path: /inspire/qb-ilm2/project/robot-learning-system/public/yehangjian/checkpoints/tau-0-vla-base
   vlm_model_type: qwen3.5
   vla_model_type: tau0_vla
-  # A single RTX 4090 cannot hold Adam states for the full 2.5B model.
-  # Keep the pretrained vision/language backbone frozen and finetune the
-  # action expert plus VLA projections.
-  tune_mm_vision: false
-  tune_mm_mlp: false
-  tune_mm_llm: false
+  tune_mm_vision: true
+  tune_mm_mlp: true
+  tune_mm_llm: true
   tune_vla_dit: true
   loss_type: fm
   num_steps: 10
@@ -37,26 +34,29 @@ data_args:
     right_wrist: "right wrist"
 
 training_args:
-  output_dir: outputs/arx_lift2s_pickplace
-  max_steps: 1000
-  per_device_train_batch_size: 1
+  output_dir: outputs/arx_lift2s_pickplace_h200_formal
+  max_steps: 10000
+  per_device_train_batch_size: 8
   gradient_accumulation_steps: 1
   model_max_length: 2048
   learning_rate: 2.0e-5
   weight_decay: 0.01
-  warmup_ratio: 0.01
+  warmup_steps: 100
   lr_scheduler_type: cosine
   max_grad_norm: 1.0
   bf16: true
+  tf32: true
   attn_implementation: sdpa
   seed: 42
   data_seed: 42
-  logging_steps: 1
+  logging_steps: 10
+  log_metrics_sync_across_ranks: false
   vlm_first_batch_pad_to_max: true
   save_strategy: steps
   save_steps: 500
-  save_total_limit: 2
-  dataloader_num_workers: 2
+  save_total_limit: 20
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
   dataloader_drop_last: true
   dataloader_pin_memory: true
   dataloader_persistent_workers: true

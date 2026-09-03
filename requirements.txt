@@ -10,6 +10,7 @@
 # --- core model stack ---
 torch==2.7.1                   # the verified build is +cu128, from the PyTorch CUDA index
 transformers==5.5.4
+huggingface-hub>=1.5.0,<2.0
 accelerate==1.13.0
 peft==0.18.0
 safetensors==0.5.2
@@ -20,7 +21,17 @@ scipy==1.16.3                  # rotation conversions in unified EEF transforms
 einops==0.8.1
 
 # --- data ---
-lerobot==0.4.1                 # LeRobot v3.0 dataset reader
+# LeRobot 0.4.1 is installed by scripts/setup.sh with --no-deps. Its published
+# metadata still caps transformers below 5 and huggingface-hub below 0.36,
+# while the Qwen3.5 stack requires transformers 5.5 and hub 1.5+. The reader is
+# runtime-compatible; declare its concrete runtime imports here and bypass only
+# those stale resolver bounds.
+datasets==4.0.0
+av>=15.0,<16
+opencv-python-headless>=4.9,<4.13
+jsonlines>=4,<5
+draccus==0.10.0
+h5py==3.16.0                   # official ARX HDF5 inspection/conversion
 pillow==11.1.0                 # ResizeWithPad / ColorJitter image transforms
 pyyaml==6.0.2
 pyarrow==20.0.0                # parquet column reads in scripts/norm_stats/
@@ -30,6 +41,7 @@ torchvision==0.22.1            # compatible with torch 2.7.1
 # --- training ---
 deepspeed==0.18.3              # the ZeRO stages scripts/deepspeed/*.json configure
 flash-linear-attention==0.5.0  # gated-delta-rule kernels the Qwen3.5 backbone imports
+causal-conv1d==1.7.0           # Qwen3.5 linear-attention convolution fast path
 
 # --- serving (deploy/) ---
 fastapi==0.101.0
@@ -41,3 +53,5 @@ matplotlib==3.10.8             # imported lazily; --no-plot runs never need it
 # `flash-attn` is installed separately by scripts/setup.sh with
 # --no-build-isolation after torch is present. Keep it out of this file: pip's
 # default isolated build cannot see the already-installed CUDA torch package.
+# The same build constraint applies to causal-conv1d; scripts/setup.sh installs
+# this requirements file with --no-build-isolation after torch is installed.

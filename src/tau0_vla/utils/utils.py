@@ -167,7 +167,9 @@ def load_config_from_yaml(yaml_path: str, overrides: dict | None = None) -> dict
         # CLI overrides always arrive as strings; coerce against the type the YAML
         # already holds.
         if isinstance(val, str):
-            val = _coerce_cli_value(val)
+            # Transformers uses the literal string "none" to disable reporting;
+            # converting it to Python None makes Trainer reject the integration.
+            val = val if key == "report_to" and val.lower() == "none" else _coerce_cli_value(val)
         if key in _experiment_keys:
             config["experiment"][key] = val
         elif key in _model_keys:

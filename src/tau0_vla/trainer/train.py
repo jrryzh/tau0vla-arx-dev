@@ -203,6 +203,76 @@ def action_forward(model, inputs, loss_scale=1.0):
     return total_loss, {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
 
 
+def _require_distributed_contract(training_args) -> None:
+    """Fail early when a guarded cluster launch has the wrong effective batch."""
+    required_world_size = os.environ.get("REQUIRE_WORLD_SIZE")
+    required_global_batch = os.environ.get("REQUIRE_GLOBAL_BATCH")
+    if not required_world_size and not required_global_batch:
+        return
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    global_batch = (
+        world_size
+        * int(training_args.per_device_train_batch_size)
+        * int(training_args.gradient_accumulation_steps)
+    )
+    if required_world_size and world_size != int(required_world_size):
+        raise RuntimeError(f"Required world_size={required_world_size}, got {world_size}")
+    if required_global_batch and global_batch != int(required_global_batch):
+        raise RuntimeError(
+            f"Required global_batch={required_global_batch}, got {global_batch} "
+            f"({world_size} ranks x {training_args.per_device_train_batch_size} micro-batch "
+            f"x {training_args.gradient_accumulation_steps} accumulation)"
+        )
+    logging.info(
+        "Distributed contract verified: world_size=%d, micro_batch=%d, accumulation=%d, global_batch=%d",
+        world_size,
+        training_args.per_device_train_batch_size,
+        training_args.gradient_accumulation_steps,
+        global_batch,
+    )
+
+
+def _require_all_training_groups(model, model_args) -> None:
+    """Validate the four full-finetuning groups for guarded H200 launches."""
+    if os.environ.get("REQUIRE_ALL_TRAINABLE", "").strip().lower() not in ("1", "true", "yes"):
+        return
+
+    switches = ("tune_mm_vision", "tune_mm_mlp", "tune_mm_llm", "tune_vla_dit")
+    disabled = [name for name in switches if not getattr(model_args, name, False)]
+    if disabled:
+        raise RuntimeError(f"Full-parameter launch requires all tune switches; disabled: {disabled}")
+
+    flow = model.flow_matching
+    vlm = flow.qwenvl_with_expert.qwenvl
+    visual = vlm.visual
+    vision_params = [param for name, param in visual.named_parameters() if not name.startswith("merger.")]
+    groups = {
+        "vision_tower": vision_params,
+        "vision_projector": list(visual.merger.parameters()),
+        "llm": list(vlm.language_model.parameters()) + list(vlm.lm_head.parameters()),
+        "vla_dit": list(flow.qwenvl_with_expert.qwen_expert.parameters())
+        + [
+            param
+            for name in (
+                "state_proj",
+                "action_in_proj",
+                "action_out_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            )
+            for param in getattr(flow, name).parameters()
+        ],
+    }
+    for name, params in groups.items():
+        if not params:
+            raise RuntimeError(f"Required trainable group {name} contains no parameters")
+        frozen = sum(param.numel() for param in params if not param.requires_grad)
+        if frozen:
+            raise RuntimeError(f"Required trainable group {name} has {frozen:,} frozen parameters")
+        logging.info("Trainable group verified: %s=%s parameters", name, f"{sum(p.numel() for p in params):,}")
+
+
 def train():
     """Main entry point for the full tau-0-vla training run.
 
@@ -309,6 +379,8 @@ def train():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
         notes = "Launched via CLI"
 
+    _require_distributed_contract(training_args)
+
     # --- Detect the GPU count and append it to run_name ---
     world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count() or 1))
     num_nodes = int(os.environ.get("NNODES", os.environ.get("SLURM_NNODES", 1)))
@@ -365,6 +437,7 @@ def train():
     mb = ModelBuilder(training_args, model_args, data_args, is_training=True)
     mb.build()
     model, processor = mb.model, mb.processor
+    _require_all_training_groups(model, model_args)
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
