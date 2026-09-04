@@ -68,6 +68,11 @@ The action-chunk endpoint accepts JSON metadata plus `head`, `left_wrist`, and
 request IDs and echoes the request/session identity. This robot-facing API is
 additive; `/act` and `/act_lerobot_bytes` keep their existing contracts.
 
+For the ARX1 deployment, bind the server to the dedicated point-to-point
+Ethernet address `192.168.77.1:8000` and allow the robot source
+`192.168.77.2`. Keep Wi-Fi for management only; the bundled
+`scripts/start_arx_lift2s_server.sh` uses these defaults.
+
 Both POST request bodies are `.npz` bundles produced by
 `deploy.wire.pack_payload`: boolean, integer, and floating-point numpy arrays
 travel as named entries and the nested dictionary/list structure travels in a
