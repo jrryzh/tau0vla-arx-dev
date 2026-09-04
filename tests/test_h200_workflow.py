@@ -34,7 +34,9 @@ class H200ResourceSelectionTest(unittest.TestCase):
                     {
                         "ws-b": {
                             "compute_groups": {
-                                "group-h200-b": {"gpu_type_display": "NVIDIA H200 141GB"},
+                                "group-h200-b": {
+                                    "gpu_type_display": "NVIDIA H200 141GB"
+                                },
                                 "group-a100": {"gpu_type": "NVIDIA_A100_SXM_80G"},
                             },
                             "specs": {
@@ -84,7 +86,9 @@ class H200ResourceSelectionTest(unittest.TestCase):
 
 
 class H200CheckpointValidationTest(unittest.TestCase):
-    def _run(self, checkpoint: Path, world_size: int = 2) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, checkpoint: Path, world_size: int = 2
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -103,11 +107,12 @@ class H200CheckpointValidationTest(unittest.TestCase):
             checkpoint = Path(directory) / "checkpoint-500"
             shard = checkpoint / "global_step500"
             shard.mkdir(parents=True)
-            for name in ("trainer_state.json", "scheduler.pt", "run_spec.json"):
+            (checkpoint / "trainer_state.json").write_text('{"global_step": 500}')
+            for name in ("scheduler.pt", "run_spec.json"):
                 (checkpoint / name).touch()
             (shard / "mp_rank_00_model_states.pt").touch()
-            (shard / "zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
             for rank in range(2):
+                (shard / f"zero_pp_rank_{rank}_mp_rank_00_optim_states.pt").touch()
                 (checkpoint / f"data_state_rank{rank}.pt").touch()
 
             result = self._run(checkpoint)
@@ -118,8 +123,8 @@ class H200CheckpointValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "checkpoint-500"
             checkpoint.mkdir()
+            (checkpoint / "trainer_state.json").write_text('{"global_step": 500}')
             for name in (
-                "trainer_state.json",
                 "scheduler.pt",
                 "run_spec.json",
                 "model.safetensors",
@@ -132,9 +137,43 @@ class H200CheckpointValidationTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("expected 2 rank data states, found 1", result.stderr)
 
+    def test_rejects_wrong_trainer_global_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint-500"
+            checkpoint.mkdir()
+            (checkpoint / "trainer_state.json").write_text('{"global_step": 499}')
+            for name in ("scheduler.pt", "run_spec.json"):
+                (checkpoint / name).touch()
+            result = self._run(checkpoint)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("global_step must be 500", result.stderr)
+
+    def test_rejects_incomplete_zero_optimizer_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint-500"
+            shard = checkpoint / "global_step500"
+            shard.mkdir(parents=True)
+            (checkpoint / "trainer_state.json").write_text('{"global_step": 500}')
+            for name in ("scheduler.pt", "run_spec.json"):
+                (checkpoint / name).touch()
+            (shard / "mp_rank_00_model_states.pt").touch()
+            (shard / "zero_pp_rank_0_mp_rank_00_optim_states.pt").touch()
+            for rank in range(2):
+                (checkpoint / f"data_state_rank{rank}.pt").touch()
+            result = self._run(checkpoint)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("expected 2 ZeRO optimizer shards, found 1", result.stderr)
+
 
 class QzcliPayloadValidationTest(unittest.TestCase):
-    def _run(self, payload: dict) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        payload: dict,
+        *,
+        instances: int = 2,
+        world_size: int = 16,
+        batch: int = 8,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
@@ -145,6 +184,20 @@ class QzcliPayloadValidationTest(unittest.TestCase):
                 "spec-h200-8",
                 "--repo",
                 str(REPO),
+                "--instances",
+                str(instances),
+                "--gpus-per-node",
+                "8",
+                "--shm-gi",
+                "1200",
+                "--world-size",
+                str(world_size),
+                "--global-batch",
+                "128",
+                "--per-device-batch",
+                str(batch),
+                "--gradient-accumulation",
+                "1",
             ],
             input="Dry run\n" + json.dumps(payload),
             text=True,
@@ -156,7 +209,11 @@ class QzcliPayloadValidationTest(unittest.TestCase):
         return {
             "framework": "pytorch",
             "logic_compute_group_id": "group-h200",
-            "command": f"cd {REPO} && bash scripts/train.sh",
+            "command": (
+                f"cd {REPO} && EXPECTED_NNODES=2 EXPECTED_GPUS_PER_NODE=8 "
+                "REQUIRE_WORLD_SIZE=16 REQUIRE_GLOBAL_BATCH=128 bash scripts/train.sh "
+                "config.yaml --per_device_train_batch_size 8 --gradient_accumulation_steps 1"
+            ),
             "framework_config": [
                 {
                     "gpu_count": 8,
@@ -181,6 +238,99 @@ class QzcliPayloadValidationTest(unittest.TestCase):
         result = self._run(payload)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("instance_count", result.stderr)
+
+    def test_accepts_one_node_batch_16_payload(self):
+        payload = self._payload()
+        payload["framework_config"][0]["instance_count"] = 1
+        payload["command"] = (
+            f"cd {REPO} && EXPECTED_NNODES=1 EXPECTED_GPUS_PER_NODE=8 "
+            "REQUIRE_WORLD_SIZE=8 REQUIRE_GLOBAL_BATCH=128 bash scripts/train.sh "
+            "config.yaml --per_device_train_batch_size 16 --gradient_accumulation_steps 1"
+        )
+        result = self._run(payload, instances=1, world_size=8, batch=16)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class H200SmokeValidationTest(unittest.TestCase):
+    def _run(self, directory: Path, *, gpu_name: str = "H200") -> subprocess.CompletedProcess[str]:
+        status = directory / "status.json"
+        worker = directory / "worker.log"
+        training = directory / "training.log"
+        status.write_text(
+            json.dumps(
+                {
+                    "job_id": "job-test",
+                    "status": "job_succeeded",
+                    "logic_compute_group_id": "group-h200",
+                    "command": (
+                        "EXPECTED_NNODES=1 EXPECTED_GPUS_PER_NODE=8 "
+                        "python scripts/check_h200_worker.py && train"
+                    ),
+                    "framework_config": [
+                        {
+                            "instance_count": 1,
+                            "gpu_count": 8,
+                            "shm_gi": 1200,
+                            "instance_spec_price_info": {
+                                "gpu_info": {"gpu_product_simple": gpu_name}
+                            },
+                        }
+                    ],
+                }
+            )
+        )
+        worker.write_text("[H200_PEAK_MEMORY] peak_mib=40304\n")
+        training.write_text(
+            "Distributed contract verified: world_size=8, micro_batch=16, "
+            "accumulation=1, global_batch=128\n"
+            + "\n".join(
+                f"Trainable group verified: {name}=1 parameters"
+                for name in ("vision_tower", "vision_projector", "llm", "vla_dit")
+            )
+            + "\n{'loss': '0.1', 'grad_norm': '1.2', 'global_step': 20}\n"
+            "{'train_runtime': '20', 'global_step': 20}\n"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "scripts/validate_h200_smoke.py"),
+                "--status-json",
+                str(status),
+                "--job-id",
+                "job-test",
+                "--compute-group",
+                "group-h200",
+                "--instances",
+                "1",
+                "--gpus-per-node",
+                "8",
+                "--shm-gi",
+                "1200",
+                "--world-size",
+                "8",
+                "--global-batch",
+                "128",
+                "--worker-log",
+                str(worker),
+                "--training-log",
+                str(training),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_accepts_hardware_and_durable_training_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(Path(directory))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("peak_mib=40304", result.stdout)
+
+    def test_rejects_non_h200_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(Path(directory), gpu_name="A100")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not prove H200", result.stderr)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from io import BytesIO
 from pathlib import Path
 
@@ -26,8 +27,10 @@ JOINT_NAMES = tuple(
     + ["right_gripper"]
 )
 ACTION_DIM = 14
+EXPECTED_IMAGE_SHAPE = (480, 640, 3)
 STATE_AS_ACTION_SEMANTICS = "state_t_plus_1"
 SOURCE_ACTION_SEMANTICS = "joint_position_command"
+EPISODE_FILE_RE = re.compile(r"^episode_(\d+)\.hdf5$")
 
 
 def sha256(path: Path) -> str:
@@ -44,13 +47,42 @@ def decode_rgb(encoded) -> np.ndarray:
         return np.asarray(image.convert("RGB"))
 
 
-def selected_paths(input_dir: Path, start: int, end: int) -> list[Path]:
+def episode_number(path: Path) -> int:
+    match = EPISODE_FILE_RE.fullmatch(path.name)
+    if match is None:
+        raise ValueError(
+            f"invalid episode filename {path.name!r}; expected episode_<integer>.hdf5"
+        )
+    return int(match.group(1))
+
+
+def selected_paths(
+    input_dir: Path, start: int, end: int, *, allow_missing: bool = False
+) -> list[Path]:
     if start < 0 or end < start:
         raise ValueError("require 0 <= start <= end")
-    paths = [input_dir / f"episode_{index}.hdf5" for index in range(start, end + 1)]
-    missing = [str(path) for path in paths if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(f"missing selected episodes: {missing}")
+    if not allow_missing:
+        paths = [input_dir / f"episode_{index}.hdf5" for index in range(start, end + 1)]
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"missing selected episodes: {missing}")
+        return paths
+
+    numbered: dict[int, Path] = {}
+    for path in input_dir.glob("episode_*.hdf5"):
+        if not path.is_file():
+            raise ValueError(f"episode candidate is not a file: {path}")
+        number = episode_number(path)
+        if number in numbered:
+            raise ValueError(
+                f"duplicate episode number {number}: {numbered[number].name}, {path.name}"
+            )
+        numbered[number] = path
+    paths = [numbered[number] for number in sorted(numbered) if start <= number <= end]
+    if not paths:
+        raise FileNotFoundError(
+            f"no valid episode files found in requested range [{start}, {end}]"
+        )
     return paths
 
 
@@ -82,8 +114,15 @@ def inspect_episode(path: Path) -> dict:
             indices = sorted({0, frames // 2, frames - 1})
             decoded = [decode_rgb(root[key][index]) for index in indices]
             if len({image.shape for image in decoded}) != 1:
-                raise ValueError(f"{path.name}: inconsistent decoded shape for {camera}")
+                raise ValueError(
+                    f"{path.name}: inconsistent decoded shape for {camera}"
+                )
             image_shapes[camera] = list(decoded[0].shape)
+            if tuple(decoded[0].shape) != EXPECTED_IMAGE_SHAPE:
+                raise ValueError(
+                    f"{path.name}: decoded {camera} shape {decoded[0].shape}; "
+                    f"expected {EXPECTED_IMAGE_SHAPE} RGB"
+                )
         base_max = 0.0
         for key in (
             "observations/robot_base",
@@ -95,10 +134,15 @@ def inspect_episode(path: Path) -> dict:
                 base_max = max(base_max, float(np.max(np.abs(root[key][()]))))
         return {
             "file": path.name,
+            "source_episode_number": episode_number(path),
             "sha256": sha256(path),
             "frames": frames,
             "source_action_semantics": str(root.attrs.get("action_semantics", "")),
-            "height_command": float(root.attrs["height_command"]) if "height_command" in root.attrs else None,
+            "height_command": (
+                float(root.attrs["height_command"])
+                if "height_command" in root.attrs
+                else None
+            ),
             "source_task": str(root.attrs.get("task", "")),
             "image_shapes": image_shapes,
             "base_max_abs": base_max,
@@ -118,7 +162,14 @@ def selected_frame_indices(frames: int, stride: int) -> range:
 
 
 def validate_selection(
-    paths: list[Path], source_fps: int, fps: int, task: str, action_mode: str
+    paths: list[Path],
+    source_fps: int,
+    fps: int,
+    task: str,
+    action_mode: str,
+    *,
+    requested_start: int | None = None,
+    requested_end: int | None = None,
 ) -> dict:
     stride = temporal_stride(source_fps, fps)
     if not task.strip():
@@ -150,9 +201,21 @@ def validate_selection(
         info["output_frames"] = selected - action_offset_frames
         if info["output_frames"] <= 0:
             raise ValueError(f"{info['file']}: no frame remains after action alignment")
-    shapes = {tuple(info["image_shapes"][camera]) for info in episodes for camera in CAMERA_NAMES}
+    shapes = {
+        tuple(info["image_shapes"][camera])
+        for info in episodes
+        for camera in CAMERA_NAMES
+    }
     if len(shapes) != 1:
         raise ValueError(f"camera decoded shapes disagree: {sorted(shapes)}")
+    selected_numbers = [info["source_episode_number"] for info in episodes]
+    if requested_start is None:
+        requested_start = min(selected_numbers)
+    if requested_end is None:
+        requested_end = max(selected_numbers)
+    missing_numbers = sorted(
+        set(range(requested_start, requested_end + 1)) - set(selected_numbers)
+    )
     return {
         "source_format": "official_ros2_lift_play_hdf5",
         "lerobot_version": None,
@@ -169,6 +232,9 @@ def validate_selection(
         "joint_names": list(JOINT_NAMES),
         "camera_names": list(CAMERA_NAMES),
         "task": task,
+        "requested_episode_range": {"start": requested_start, "end": requested_end},
+        "selected_source_episode_numbers": selected_numbers,
+        "missing_source_episode_numbers": missing_numbers,
         "total_episodes": len(episodes),
         "total_source_frames": sum(info["source_frames"] for info in episodes),
         "total_frames": sum(info["output_frames"] for info in episodes),
@@ -177,9 +243,20 @@ def validate_selection(
 
 
 def convert(args) -> dict:
-    paths = selected_paths(args.input, args.start, args.end)
+    paths = selected_paths(
+        args.input,
+        args.start,
+        args.end,
+        allow_missing=args.allow_missing_episodes,
+    )
     manifest = validate_selection(
-        paths, args.source_fps, args.fps, args.task, args.action_mode
+        paths,
+        args.source_fps,
+        args.fps,
+        args.task,
+        args.action_mode,
+        requested_start=args.start,
+        requested_end=args.end,
     )
     if args.validate_only:
         return manifest
@@ -278,24 +355,34 @@ def convert(args) -> dict:
                         root["observations/qpos"][observation_index], dtype=np.float32
                     ),
                     "action": np.asarray(
-                        root["observations/qpos"][action_index]
-                        if args.action_mode == "state_t_plus_1"
-                        else root["action"][action_index],
+                        (
+                            root["observations/qpos"][action_index]
+                            if args.action_mode == "state_t_plus_1"
+                            else root["action"][action_index]
+                        ),
                         dtype=np.float32,
                     ),
                     "task": args.task,
                 }
                 for camera in CAMERA_NAMES:
-                    frame[f"observation.images.{camera}"] = decode_rgb(
+                    image = decode_rgb(
                         root[f"observations/images/{camera}"][observation_index]
                     )
+                    if image.shape != EXPECTED_IMAGE_SHAPE:
+                        raise ValueError(
+                            f"{path.name}: frame {observation_index} camera {camera} "
+                            f"decoded as {image.shape}; expected {EXPECTED_IMAGE_SHAPE}"
+                        )
+                    frame[f"observation.images.{camera}"] = image
                 dataset.add_frame(frame)
             dataset.save_episode()
     dataset.finalize()
 
     sidecar = args.output / "meta" / "arx.json"
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    sidecar.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     return manifest
 
 
@@ -304,8 +391,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--start", type=int, required=True)
     parser.add_argument("--end", type=int, required=True)
+    parser.add_argument(
+        "--allow-missing-episodes",
+        action="store_true",
+        help=(
+            "convert valid episode_<integer>.hdf5 files present in the requested "
+            "range and record missing source episode numbers in the manifest"
+        ),
+    )
     parser.add_argument("--source-fps", type=int, default=60)
-    parser.add_argument("--fps", type=int, default=60, help="output fps; must divide source-fps")
+    parser.add_argument(
+        "--fps", type=int, default=60, help="output fps; must divide source-fps"
+    )
     parser.add_argument("--task", required=True)
     parser.add_argument(
         "--action-mode",

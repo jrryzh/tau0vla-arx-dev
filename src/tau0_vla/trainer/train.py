@@ -601,9 +601,18 @@ def train():
 
     model.config.use_cache = True
 
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-
-    processor.save_pretrained(training_args.output_dir)
+    skip_final_save = os.environ.get("SKIP_FINAL_SAVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if skip_final_save:
+        logging.info("SKIP_FINAL_SAVE=1: omitting final model/processor save for this run")
+    else:
+        safe_save_model_for_hf_trainer(
+            trainer=trainer, output_dir=training_args.output_dir
+        )
+        processor.save_pretrained(training_args.output_dir)
 
 
 def _maybe_wait_for_debugger() -> None:

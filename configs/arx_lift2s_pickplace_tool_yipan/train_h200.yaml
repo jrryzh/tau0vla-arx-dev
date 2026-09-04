@@ -1,0 +1,67 @@
+experiment:
+  run_name: arx_lift2s_pickplace_tool_yipan_h200_formal
+  project_name: tau-0-vla
+  notes: "ARX LIFT2s tool-to-tray full-parameter H200 training; global batch 128."
+
+model_args:
+  model_name_or_path: /inspire/qb-ilm2/project/robot-learning-system/public/yehangjian/checkpoints/tau-0-vla-base
+  vlm_model_type: qwen3.5
+  vla_model_type: tau0_vla
+  tune_mm_vision: true
+  tune_mm_mlp: true
+  tune_mm_llm: true
+  tune_vla_dit: true
+  loss_type: fm
+  num_steps: 10
+  vlm_causal: true
+  tau_vla_prefix_flash_backend: true
+  vla_inactive_input_zero: true
+
+data_args:
+  config_name: arx_lift2s_pickplace_tool_yipan_ft
+  filter_dataset_by_stats: false
+  max_images_per_sample: 3
+  vla_max_token_len: 2048
+  max_pixels: 50176
+  min_pixels: 3136
+  camera_keys:
+    - head
+    - left_wrist
+    - right_wrist
+  cam_view_template: "{} view: <image>"
+  cam_view_names:
+    head: "head"
+    left_wrist: "left wrist"
+    right_wrist: "right wrist"
+
+training_args:
+  output_dir: outputs/arx_lift2s_pickplace_tool_yipan_h200_formal
+  max_steps: 10000
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 1
+  model_max_length: 2048
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_steps: 100
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  bf16: true
+  tf32: true
+  attn_implementation: sdpa
+  seed: 42
+  data_seed: 42
+  logging_steps: 10
+  log_metrics_sync_across_ranks: false
+  vlm_first_batch_pad_to_max: true
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 20
+  dataloader_num_workers: 4
+  dataloader_prefetch_factor: 2
+  dataloader_drop_last: true
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  report_to: none
+  ddp_find_unused_parameters: true
+  ddp_timeout: 7200
+  deepspeed: scripts/deepspeed/zero1.json

@@ -976,6 +976,11 @@ class Tau0VLATrainer(Trainer):
             start_time: Training start timestamp, passed straight through to the
                 base class.
         """
+        # Keep the actual optimizer step in the text log. Besides making long
+        # runs easier to audit, the guarded H200 controller uses this to prove
+        # that training continued beyond a successfully saved checkpoint.
+        logs["global_step"] = int(self.state.global_step)
+
         if self._is_step_profiling_enabled():
             for key in sorted(getattr(self, "_profile_stats", {}).keys()):
                 stats = self._profile_stats[key]
