@@ -91,6 +91,7 @@ def package(args) -> Path:
         "joint-vr",
     ):
         raise ValueError("inference bundle supports calibrated joint-feedback/joint-vr only")
+    model_sha256 = _sha256(output / "model.safetensors")
     deployment = {
         "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -105,7 +106,7 @@ def package(args) -> Path:
         "route": spec.get("finch_config_name"),
         "robot_name": spec.get("robot_name"),
         "deployment_contract": deployment_contract,
-        "model_sha256": _sha256(output / "model.safetensors"),
+        "model_sha256": model_sha256,
         "run_spec_sha256": _sha256(output / "run_spec.json"),
         "deployment_kind": "inference-only",
         "model_storage": "hardlink" if linked_model else "copy",
@@ -125,7 +126,11 @@ def package(args) -> Path:
         path for path in output.rglob("*") if path.is_file() and path.name != "SHA256SUMS"
     )
     (output / "SHA256SUMS").write_text(
-        "".join(f"{_sha256(path)}  {path.relative_to(output).as_posix()}\n" for path in checksum_paths),
+        "".join(
+            f"{model_sha256 if path.name == 'model.safetensors' else _sha256(path)}  "
+            f"{path.relative_to(output).as_posix()}\n"
+            for path in checksum_paths
+        ),
         encoding="utf-8",
     )
     return output
