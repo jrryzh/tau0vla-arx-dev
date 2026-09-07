@@ -59,9 +59,10 @@ def package(args) -> Path:
         raise FileNotFoundError(f"missing run data spec: {spec_root}")
     spec_files = list(spec_root.glob("*/spec.json"))
     matched = []
+    accepted_route_names = {str(routes[0]), str(routes[0]).replace("_", "-")}
     for path in spec_files:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if payload.get("finch_config_name") == routes[0]:
+        if payload.get("finch_config_name") in accepted_route_names:
             matched.append(path.parent)
     if len(matched) != 1:
         raise ValueError(f"route {routes[0]!r} resolved to {len(matched)} data specs")
