@@ -52,6 +52,7 @@ def test_package_is_self_contained_and_excludes_training_state(tmp_path):
         model_id="blue-feedback-10000",
         task_instruction="pick blue",
         repo_root=ROOT,
+        link_model=True,
     ))
     assert result == output
     assert (output / "finch_data_spec" / route / "spec.json").is_file()
@@ -60,6 +61,8 @@ def test_package_is_self_contained_and_excludes_training_state(tmp_path):
     assert manifest["route"] == route
     assert manifest["training_git_dirty"] is True
     assert manifest["deployment_kind"] == "inference-only"
+    assert manifest["model_storage"] == "hardlink"
+    assert (output / "model.safetensors").stat().st_ino == (checkpoint / "model.safetensors").stat().st_ino
     assert "optimizer.pt" in manifest["excluded_training_state"]
     with pytest.raises(FileExistsError):
         MODULE.package(SimpleNamespace(
@@ -69,4 +72,5 @@ def test_package_is_self_contained_and_excludes_training_state(tmp_path):
             model_id="blue-feedback-10000",
             task_instruction="pick blue",
             repo_root=ROOT,
+            link_model=True,
         ))

@@ -71,8 +71,15 @@ def package(args) -> Path:
             raise FileNotFoundError(f"data spec is missing {name}: {spec_dir}")
 
     output.mkdir(parents=True)
+    linked_model = bool(getattr(args, "link_model", False))
     for name in INFERENCE_FILES:
-        shutil.copy2(checkpoint / name, output / name)
+        source = checkpoint / name
+        target = output / name
+        if name == "model.safetensors" and linked_model:
+            source.chmod(0o444)
+            target.hardlink_to(source)
+        else:
+            shutil.copy2(source, target)
     shutil.copytree(spec_dir, output / "finch_data_spec" / spec_dir.name)
 
     spec = json.loads((spec_dir / "spec.json").read_text(encoding="utf-8"))
@@ -100,6 +107,7 @@ def package(args) -> Path:
         "model_sha256": _sha256(output / "model.safetensors"),
         "run_spec_sha256": _sha256(output / "run_spec.json"),
         "deployment_kind": "inference-only",
+        "model_storage": "hardlink" if linked_model else "copy",
         "excluded_training_state": [
             "global_step*/",
             "optimizer.pt",
@@ -130,6 +138,11 @@ def parse_args():
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--task-instruction", required=True)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--link-model",
+        action="store_true",
+        help="hardlink model.safetensors on the same filesystem to avoid a duplicate 6GB copy",
+    )
     return parser.parse_args()
 
 
