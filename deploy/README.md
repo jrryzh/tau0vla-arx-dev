@@ -223,31 +223,22 @@ For an external config module, pass `--config-module` so the same
 `@register_config` runs on the evaluation side.
 # ARX 校准协议 v3
 
-Blue/T 校准模型只开放 `/arx/v3/policy-contract` 和 `/arx/v3/action-chunks`；旧 `/act` 及 ARX v1/v2 路由不可用于这些模型。旧模型继续使用原协议。
+Blue/T `joint-feedback` 与 `joint-vr` checkpoint 使用独立、sessioned接口；旧checkpoint继续使用原有 `/act` 和 `/api/v1/arx-lift2s/*`，二者不自动混用：
 
-启动仍使用 `python -m deploy.server --model <checkpoint> --device cuda`。POST 请求采用 multipart：三个 JPEG 字段 `head`、`left_wrist`、`right_wrist`，以及 JSON 字符串字段 `metadata`。metadata 必须包含：
+- `GET /health`
+- `GET /arx/v3/policy-contract`
+- `POST /arx/v3/sessions`
+- `POST /arx/v3/sessions/{session_id}/action-chunks`
 
-```json
-{
-  "protocol_version": "arx-calibrated-v3",
-  "calibration_version": "arx-open-baseline-v1",
-  "experiment": "eef-vr",
-  "request_id": 1,
-  "sample_monotonic_ns": 123456789,
-  "task_instruction": "Pick up the T-shaped part and place it in its designated position on the board.",
-  "raw_joint_feedback": [0,0,0,0,0,0,-2,0,0,0,0,0,0,-3],
-  "raw_eef_feedback": [0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-  "open_baselines": {"left": -2, "right": -3}
-}
-```
+session固定任务、模型、实验类型、robot ID、calibration ID和左右open baseline。新session使旧session失效，请求ID严格递增。action请求使用multipart三路JPEG与JSON metadata；metadata只包含原始14D joint/EEF feedback、request ID和采样时间，服务端用session baseline校准输入。
 
-示例数值仅用于说明结构，实际请求须使用真实反馈与当前校准值。两种反馈都保持采集 14D 顺序 `[left6, gripper, right6, gripper]`。服务端扣除一次全开基线；请求不得传入已经校准的 state。`experiment` 必须匹配 checkpoint 的 joint-vr、joint-feedback 或 eef-vr。
+响应字段 `calibrated_action_chunk` 为 `[30,14]`，明确携带 `wire_action_is_robot_command=false`。手臂列是绝对关节目标；夹爪列仍是校准feedback位置或`[0,1]` VR闭合意图，必须由 `arx-calibrated-client-v1` 使用本次command-feedback标定转换后才能发布。EEF checkpoint继续可训练/离线评估，但本轮HTTP真机接口拒绝EEF route。
 
-返回 `actions` 为具名分量。joint 返回左右绝对关节角；EEF 返回左右绝对 xyz 米和四元数 xyzw。左右夹爪以单列单独返回，`gripper_semantics` 明确它是 VR 闭合意图比例或基线校准后的反馈位置。`pose_convention` 保存源 RPY 约定。服务端结果始终包含 `robot_client_adapted: false`：ROS EEF 发布和 VR→底层夹爪驱动映射仍待驱动契约明确后实现。
-
-每次推理在 `outputs/arx_calibrated_inference/<model_id>/` 保存 NPZ，包含原始 joint/EEF、基线、校准后输入、三相机、动作、请求时间和模型标识。支持无需机器人在线的回放：
+每次推理在配置的record目录保存NPZ，包含原始反馈、baseline、校准state、模型action、三相机和session/request身份。支持无需机器人在线的回放：
 
 ```bash
 PYTHONPATH=src:. .venv/bin/python scripts/replay_blue_t_request.py \
   --model <checkpoint> --request <recorded-request.npz> --out outputs/offline_replay
 ```
+
+使用 `scripts/package_arx_inference_bundle.py` 将checkpoint与其run-level `finch_data_spec`打包成自包含推理目录。模型服务器用 `scripts/manage_arx_server.py prepare|candidate|promote|rollback|status` 校验、候选测试、切换和回滚；candidate固定为`127.0.0.1:8001`，production固定为`192.168.50.2:8000`。

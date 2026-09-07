@@ -83,6 +83,7 @@ def build_app(
     adapter: str | None = None,
     model_id: str | None = None,
     checkpoint_sha256: str | None = None,
+    record_dir: str | Path | None = None,
     allowed_client_ips: tuple[str, ...] = (),
 ) -> FastAPI:
     from tau0_vla.data import action_slices as _action_slices
@@ -90,7 +91,7 @@ def build_app(
     if getattr(policy.data_spec, "deployment_contract", None) is not None:
         from deploy.arx_calibrated_http import build_calibrated_app
         return build_calibrated_app(policy, model_id=model_id, checkpoint_sha256=checkpoint_sha256,
-                                    allowed_client_ips=allowed_client_ips)
+                                    record_dir=record_dir, allowed_client_ips=allowed_client_ips)
     _require_public_v1_joint_only(policy.data_spec)
     # Embodiment-specific wire knowledge (SDK payload keys, camera aliases,
     # state channel map, SDK action column order) lives in layer 3 of an
@@ -218,6 +219,8 @@ def main() -> None:
                    help="Stable identifier returned to ARX clients; defaults to the checkpoint directory name.")
     p.add_argument("--checkpoint-sha256", default=None,
                    help="Verified model.safetensors SHA-256 reported by health and policy-contract.")
+    p.add_argument("--record-dir", default=None,
+                   help="Root directory for calibrated-v3 per-request NPZ records.")
     p.add_argument("--allow-client-ip", action="append", default=[],
                    help="Allow one source IP. Repeat for ARX1 and localhost; omit to disable filtering.")
     args = p.parse_args()
@@ -248,6 +251,7 @@ def main() -> None:
             adapter=args.adapter,
             model_id=args.model_id or f"tau0vla:{Path(args.model).resolve().name}",
             checkpoint_sha256=args.checkpoint_sha256,
+            record_dir=args.record_dir,
             allowed_client_ips=tuple(args.allow_client_ip),
         ),
         host=args.host,

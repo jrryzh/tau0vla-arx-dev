@@ -68,10 +68,12 @@ def spec_for(tmp_path, mode):
         "per_embodiment": {cls._unified_registry_key: {"state": stats, "action": stats}}}))
     return SimpleNamespace(robot_cls=cls, robot_name=cls.robot_name, unified_registry_key=cls._unified_registry_key,
         unified_has_eef=mode == "eef-vr", config_modules=(), finch_config_name=mode+str(tmp_path), artifacts_dir=str(tmp_path),
-        norm_stats_path=str(path), action_dim=40, deployment_contract=contract(mode), action_semantics=contract(mode)["action_semantics"])
+        norm_stats_path=str(path), action_dim=40, action_chunk_size=30,
+        cam_keys=("head", "left_wrist", "right_wrist"),
+        deployment_contract=contract(mode), action_semantics=contract(mode)["action_semantics"])
 
 
-@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("mode", ("joint-feedback", "joint-vr"))
 def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
     spec = spec_for(tmp_path, mode)
     rng = np.random.default_rng(3)
@@ -118,25 +120,105 @@ def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
         jpeg = BytesIO()
         Image.fromarray(images["head"]).save(jpeg, format="JPEG")
         files = {key: (key+".jpg", jpeg.getvalue(), "image/jpeg") for key in images}
-        transport = httpx.ASGITransport(app=build_calibrated_app(policy, record_dir=tmp_path))
+        transport = httpx.ASGITransport(app=build_calibrated_app(
+            policy, model_id="calibrated-test", checkpoint_sha256="abc", record_dir=tmp_path
+        ))
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            health = await client.get('/health')
+            assert health.status_code == 200
+            assert health.json()["protocol_version"] == PROTOCOL
             assert (await client.get('/arx/v3/policy-contract')).status_code == 200
             assert (await client.post('/act')).status_code == 404
             assert (await client.post('/arx/v1/sessions')).status_code == 404
-            rejected = await client.post('/arx/v3/action-chunks', data={"metadata": json.dumps({**raw,"protocol_version":"arx-v1"})}, files=files)
-            assert rejected.status_code == 422
-            response = await client.post('/arx/v3/action-chunks', data={"metadata": json.dumps(raw)}, files=files)
+            session_payload = {
+                "protocol_version": PROTOCOL,
+                "calibration_version": VERSION,
+                "client_adapter_version": "arx-calibrated-client-v1",
+                "experiment": mode,
+                "task_instruction": "pick",
+                "client_name": "test",
+                "robot_id": "ark-2",
+                "calibration_id": "calibration",
+                "open_baselines": {"left": .12, "right": -.13},
+            }
+            session = await client.post('/arx/v3/sessions', json=session_payload)
+            assert session.status_code == 200, session.text
+            session_id = session.json()["session_id"]
+            request = {
+                "protocol_version": PROTOCOL,
+                "request_id": 1,
+                "sample_monotonic_ns": 1,
+                "raw_joint_feedback": q[0].tolist(),
+                "raw_eef_feedback": eef[0].tolist(),
+            }
+            rejected = await client.post(
+                f'/arx/v3/sessions/{session_id}/action-chunks',
+                data={"metadata": json.dumps({**request, "protocol_version": "arx-v1"})},
+                files=files,
+            )
+            assert rejected.status_code == 409
+            response = await client.post(
+                f'/arx/v3/sessions/{session_id}/action-chunks',
+                data={"metadata": json.dumps(request)},
+                files=files,
+            )
             assert response.status_code == 200, response.text
             assert response.json()["gripper_semantics"] == contract(mode)["gripper_action"]
             assert response.json()["control_mode"] == mode.split('-')[0]
-            assert response.json()["robot_client_adapted"] is False
+            assert response.json()["wire_action_is_robot_command"] is False
+            assert np.asarray(response.json()["calibrated_action_chunk"]).shape == (30, 14)
+            duplicate = await client.post(
+                f'/arx/v3/sessions/{session_id}/action-chunks',
+                data={"metadata": json.dumps(request)},
+                files=files,
+            )
+            assert duplicate.status_code == 409
         recordings = list(tmp_path.rglob('request-*.npz'))
         assert len(recordings) == 1
         with np.load(recordings[0], allow_pickle=False) as recording:
             np.testing.assert_array_equal(recording['calibrated_native_state'], states[0])
-            np.testing.assert_array_equal(recording['actions'], restored)
-            assert json.loads(str(recording['request_json'])) == raw
+            assert recording['calibrated_action_chunk'].shape == (30, 14)
+            saved_request = json.loads(str(recording['request_json']))
+            assert saved_request["calibration_id"] == "calibration"
             assert json.loads(str(recording['response_json']))['request_received_utc']
+    asyncio.run(check())
+
+
+def test_new_calibrated_session_invalidates_previous_session(tmp_path):
+    import asyncio
+    import httpx
+
+    spec = spec_for(tmp_path, "joint-feedback")
+    policy = SimpleNamespace(
+        data_spec=spec,
+        rtc_enabled=False,
+        infer=lambda payload: {"actions": np.zeros((30, 14), dtype=np.float32)},
+    )
+    app = build_calibrated_app(policy, record_dir=tmp_path)
+    payload = {
+        "protocol_version": PROTOCOL,
+        "calibration_version": VERSION,
+        "client_adapter_version": "wrong-client",
+        "experiment": "joint-feedback",
+        "task_instruction": "pick",
+        "client_name": "test",
+        "robot_id": "ark-2",
+        "calibration_id": "one",
+        "open_baselines": {"left": -3.3, "right": -3.3},
+    }
+
+    async def check():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            rejected = await client.post('/arx/v3/sessions', json=payload)
+            assert rejected.status_code == 409
+            payload["client_adapter_version"] = "arx-calibrated-client-v1"
+            first = (await client.post('/arx/v3/sessions', json=payload)).json()["session_id"]
+            second = (await client.post(
+                '/arx/v3/sessions', json={**payload, "calibration_id": "two"}
+            )).json()["session_id"]
+            assert first != second
+
     asyncio.run(check())
 
 

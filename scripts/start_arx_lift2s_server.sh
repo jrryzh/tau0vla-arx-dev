@@ -11,6 +11,7 @@ script_path="${repo_root}/scripts/$(basename "${BASH_SOURCE[0]}")"
 : "${MODEL_ID:=tau0vla-arx-pickplace-h200-step10000}"
 : "${TMUX_SESSION:=tau0vla-arx-server}"
 : "${LOG_DIR:=/home/xiangchengliu/logs/tau0vla-arx}"
+: "${ARX_RECORD_DIR:=/home/xiangchengliu/logs/tau0vla-arx/requests}"
 : "${CHECKPOINT_SHA256:?Set CHECKPOINT_SHA256 to the verified model.safetensors digest}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -33,6 +34,7 @@ if [[ "${1:-}" == "--foreground" ]]; then
     --port "${PORT}" \
     --model-id "${MODEL_ID}" \
     --checkpoint-sha256 "${CHECKPOINT_SHA256}" \
+    --record-dir "${ARX_RECORD_DIR}" \
     --allow-client-ip "${ARX_CLIENT_IP}" \
     --allow-client-ip "${BIND_HOST}" \
     --allow-client-ip 127.0.0.1 \
@@ -47,6 +49,18 @@ if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
 fi
 
 mkdir -p "${LOG_DIR}"
-export MODEL_DIR PYTHON_BIN BIND_HOST PORT ARX_CLIENT_IP MODEL_ID TMUX_SESSION LOG_DIR CHECKPOINT_SHA256
-tmux new-session -d -s "${TMUX_SESSION}" "$(printf '%q' "${script_path}") --foreground"
+: "${LOG_FILE:=${LOG_DIR}/server_$(date +%Y%m%d_%H%M%S).log}"
+tmux new-session -d -s "${TMUX_SESSION}" env \
+  MODEL_DIR="${MODEL_DIR}" \
+  PYTHON_BIN="${PYTHON_BIN}" \
+  BIND_HOST="${BIND_HOST}" \
+  PORT="${PORT}" \
+  ARX_CLIENT_IP="${ARX_CLIENT_IP}" \
+  MODEL_ID="${MODEL_ID}" \
+  TMUX_SESSION="${TMUX_SESSION}" \
+  LOG_DIR="${LOG_DIR}" \
+  LOG_FILE="${LOG_FILE}" \
+  ARX_RECORD_DIR="${ARX_RECORD_DIR}" \
+  CHECKPOINT_SHA256="${CHECKPOINT_SHA256}" \
+  "${script_path}" --foreground
 echo "Started ${TMUX_SESSION}; attach with: tmux attach -t ${TMUX_SESSION}"

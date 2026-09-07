@@ -1,35 +1,108 @@
-"""ARX v3 server-only calibrated protocol; no robot driver mapping is implied."""
+"""Sessioned ARX calibrated-v3 HTTP API.
+
+The wire action is deliberately *not* a robot command. Arm columns are
+absolute joint targets, while gripper columns retain the checkpoint's
+calibrated-feedback or VR-intent semantics. Only the reviewed ARX calibrated
+client may convert them into X5 command coordinates.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
-from threading import Lock
+import threading
 import time
 import uuid
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 import numpy as np
+from pydantic import BaseModel
 
-from tau0_vla.adapters.arx_lift2s.calibrated import (
-    PROTOCOL, VERSION, POSE_INDICES, calibrate_joint, contract,
-)
-from tau0_vla.data import action_slices
 from deploy.arx_lift2s_http import _read_jpeg
+from tau0_vla.adapters.arx_lift2s.calibrated import PROTOCOL, VERSION, calibrate_joint, contract
+from tau0_vla.adapters.arx_lift2s.deploy_io import build_native_action_perm
+from tau0_vla.adapters.arx_lift2s.layout import ARX_LIFT2S_JOINT_NAMES
+from tau0_vla.data import action_slices
 
 
-def validate_model_contract(spec):
+CLIENT_ADAPTER_VERSION = "arx-calibrated-client-v1"
+CAMERA_NAMES = ("head", "left_wrist", "right_wrist")
+ACTION_DIM = 14
+ACTION_HORIZON = 30
+FPS = 30
+SUPPORTED_EXPERIMENTS = ("joint-feedback", "joint-vr")
+logger = logging.getLogger(__name__)
+
+
+class SessionRequest(BaseModel):
+    protocol_version: str
+    calibration_version: str
+    client_adapter_version: str
+    experiment: str
+    task_instruction: str
+    client_name: str
+    robot_id: str
+    calibration_id: str
+    open_baselines: dict[str, float]
+
+
+@dataclass
+class _Session:
+    session_id: str
+    task_instruction: str
+    experiment: str
+    client_name: str
+    robot_id: str
+    calibration_id: str
+    open_baselines: dict[str, float]
+    last_request_id: int = 0
+
+
+def validate_model_contract(spec) -> dict[str, Any]:
     saved = getattr(spec, "deployment_contract", None)
     if not isinstance(saved, dict) or saved != contract(saved.get("experiment")):
         raise ValueError("checkpoint is missing the calibrated deployment contract")
     mode = saved["experiment"]
-    expected_key = "arx_calibrated_eef_v1" if mode == "eef-vr" else "arx_calibrated_joint_v1"
-    if spec.unified_registry_key != expected_key or bool(spec.unified_has_eef) != (mode == "eef-vr") or spec.action_semantics != saved["action_semantics"]:
+    if mode not in SUPPORTED_EXPERIMENTS:
+        raise ValueError(f"calibrated ARX HTTP supports {SUPPORTED_EXPERIMENTS}, got {mode!r}")
+    if (
+        spec.unified_registry_key != "arx_calibrated_joint_v1"
+        or bool(spec.unified_has_eef)
+        or spec.action_semantics != saved["action_semantics"]
+    ):
         raise ValueError("checkpoint encoding and deployment contract disagree")
+    if tuple(getattr(spec, "cam_keys", ())) != CAMERA_NAMES:
+        raise ValueError(f"calibrated ARX checkpoint requires cameras {CAMERA_NAMES}")
+    if int(getattr(spec, "action_chunk_size", 0)) != ACTION_HORIZON:
+        raise ValueError("calibrated ARX checkpoint requires a 30-step action horizon")
     return saved
 
 
-def adapt_request(raw, images, spec):
+def _finite_vector(value: Any, name: str) -> np.ndarray:
+    try:
+        array = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be numeric") from error
+    if array.shape != (ACTION_DIM,) or not np.isfinite(array).all():
+        raise ValueError(f"{name} must be a finite {ACTION_DIM}-vector")
+    return array
+
+
+def _validate_open_baselines(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict) or set(value) != {"left", "right"}:
+        raise ValueError("open_baselines requires exactly left and right")
+    result = {side: float(value[side]) for side in ("left", "right")}
+    if not np.isfinite(list(result.values())).all():
+        raise ValueError("open_baselines must be finite")
+    return result
+
+
+def adapt_request(raw: dict[str, Any], images: dict[str, np.ndarray], spec) -> dict[str, Any]:
+    """Build the policy payload from raw robot feedback and fixed session data."""
     saved = validate_model_contract(spec)
     if raw.get("protocol_version") != PROTOCOL or raw.get("calibration_version") != VERSION:
         raise ValueError("explicit v3 protocol and calibration version required")
@@ -37,94 +110,303 @@ def adapt_request(raw, images, spec):
         raise ValueError("request experiment does not match checkpoint")
     if any(key in raw for key in ("state", "observation_state", "calibrated_state")):
         raise ValueError("send raw feedback and open baselines; pre-calibrated state is not accepted")
-    joint = np.asarray(raw["raw_joint_feedback"], dtype=np.float64)
-    eef = np.asarray(raw["raw_eef_feedback"], dtype=np.float64)
-    if joint.shape != (14,) or eef.shape != (14,) or not np.isfinite(eef).all():
-        raise ValueError("raw joint and EEF feedback must each be finite 14-vectors")
-    opened = raw["open_baselines"]
-    if set(opened) != {"left", "right"}:
-        raise ValueError("open_baselines requires left and right")
-    state = calibrate_joint(joint, [opened["left"], opened["right"]])
-    if saved["control_mode"] == "eef":
-        state = np.concatenate([state, eef[POSE_INDICES]]).astype(np.float32)
-    instruction = raw["task_instruction"]
+    joint = _finite_vector(raw.get("raw_joint_feedback"), "raw_joint_feedback")
+    eef = _finite_vector(raw.get("raw_eef_feedback"), "raw_eef_feedback")
+    opened = _validate_open_baselines(raw.get("open_baselines"))
+    instruction = raw.get("task_instruction")
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("task_instruction must not be empty")
     for key in ("request_id", "sample_monotonic_ns"):
         if isinstance(raw.get(key), bool) or not isinstance(raw.get(key), int) or raw[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
-    if set(images) != {"head", "left_wrist", "right_wrist"}:
+    if set(images) != set(CAMERA_NAMES):
         raise ValueError("three camera images required")
-    return {"state": state, "images": images, "prompt": instruction.strip(), "meta": {
-        "request_id": raw["request_id"], "sample_monotonic_ns": raw["sample_monotonic_ns"]}}
+    state = calibrate_joint(joint, [opened["left"], opened["right"]])
+    return {
+        "state": state,
+        "images": images,
+        "prompt": instruction.strip(),
+        "meta": {
+            "request_id": raw["request_id"],
+            "sample_monotonic_ns": raw["sample_monotonic_ns"],
+            "raw_eef_feedback": eef,
+        },
+    }
 
 
-def infer_and_record(policy, raw, images, *, model_id, record_dir):
-    payload = adapt_request(raw, images, policy.data_spec)
+def _contract_payload(saved, *, model_id: str, checkpoint_sha256: str | None, record_dir: Path):
+    return {
+        **saved,
+        "protocol_version": PROTOCOL,
+        "calibration_version": VERSION,
+        "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
+        "robot": "ARX LIFT2s",
+        "fps": FPS,
+        "camera_names": list(CAMERA_NAMES),
+        "state_dim": ACTION_DIM,
+        "action_dim": ACTION_DIM,
+        "action_horizon": ACTION_HORIZON,
+        "action_dt": 1.0 / FPS,
+        "joint_names": list(ARX_LIFT2S_JOINT_NAMES),
+        "wire_action_field": "calibrated_action_chunk",
+        "wire_action_is_robot_command": False,
+        "model_id": model_id,
+        "checkpoint_sha256": checkpoint_sha256,
+        "record_dir": str(record_dir),
+    }
+
+
+def build_calibrated_app(
+    policy,
+    *,
+    model_id: str | None = None,
+    checkpoint_sha256: str | None = None,
+    record_dir: str | Path | None = None,
+    allowed_client_ips: tuple[str, ...] = (),
+) -> FastAPI:
     saved = validate_model_contract(policy.data_spec)
-    received = datetime.now(timezone.utc).isoformat()
-    started = time.monotonic_ns()
-    result = policy.infer(payload)
-    actions = np.asarray(result["actions"], dtype=np.float32)
-    slices = action_slices(policy.data_spec)
-    width = sum(dim for _, _, dim in slices)
-    if actions.shape != (30, width) or not np.isfinite(actions).all():
-        raise ValueError("policy returned invalid action chunk")
-    split = {name: actions[:, offset:offset+dim].tolist() for name, offset, dim in slices}
-    response = {"protocol_version": PROTOCOL, "model_id": model_id, "request_id": raw["request_id"],
-        "sample_monotonic_ns": raw["sample_monotonic_ns"], "request_received_utc": received,
-        "experiment": saved["experiment"], "control_mode": saved["control_mode"], "gripper_semantics": saved["gripper_action"],
-        "calibration_version": VERSION, "action_dt": 1/30, "pose_convention": saved["pose_convention"],
-        "actions": split, "inference_ms": (time.monotonic_ns()-started)/1e6, "robot_client_adapted": False}
-    directory = Path(record_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    identifier = uuid.uuid4().hex
-    target = directory / f"request-{raw['request_id']}-{identifier}.npz"
-    temporary = target.with_suffix(".tmp")
-    with temporary.open("wb") as stream:
-        np.savez_compressed(stream, request_json=json.dumps(raw), response_json=json.dumps(response),
-            raw_joint_feedback=np.asarray(raw["raw_joint_feedback"]), raw_eef_feedback=np.asarray(raw["raw_eef_feedback"]),
-            open_baselines=np.array([raw["open_baselines"][s] for s in ("left", "right")]),
-            calibrated_native_state=payload["state"], actions=actions, **{f"image_{k}": v for k, v in images.items()})
-    temporary.replace(target)
-    return response
-
-
-def build_calibrated_app(policy, *, model_id=None, checkpoint_sha256=None, record_dir=None, allowed_client_ips=()):
-    saved = validate_model_contract(policy.data_spec)
-    if getattr(policy, "rtc_enabled", False):
-        raise ValueError("calibrated v1 experiment requires RTC disabled")
+    if bool(getattr(policy, "rtc_enabled", False)):
+        raise ValueError("calibrated v3 experiments require RTC disabled")
     model_id = model_id or policy.data_spec.finch_config_name
-    record_dir = Path(record_dir or "outputs/arx_calibrated_inference") / str(model_id).replace("/", "_")
-    app = FastAPI(title="ARX calibrated v3 — server protocol")
-    lock = Lock()
+    record_root = Path(record_dir or "outputs/arx_calibrated_inference")
+    model_record_dir = record_root / str(model_id).replace("/", "_")
+    model_record_dir.mkdir(parents=True, exist_ok=True)
+    native_perm = build_native_action_perm(action_slices(policy.data_spec))
+
+    app = FastAPI(title="ARX calibrated v3")
+    state_lock = threading.Lock()
+    inference_lock = threading.Lock()
+    active: _Session | None = None
+
     if allowed_client_ips:
-        from fastapi import Request
-        from fastapi.responses import JSONResponse
+        allowed = frozenset(allowed_client_ips)
 
         @app.middleware("http")
-        async def restrict_client(request: Request, call_next):
-            if request.client is None or request.client.host not in allowed_client_ips:
+        async def restrict_client(request, call_next):
+            if request.client is None or request.client.host not in allowed:
                 return JSONResponse(status_code=403, content={"detail": "client IP not allowed"})
             return await call_next(request)
 
+    contract_payload = _contract_payload(
+        saved,
+        model_id=model_id,
+        checkpoint_sha256=checkpoint_sha256,
+        record_dir=model_record_dir,
+    )
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "ready": True,
+            "route": policy.data_spec.finch_config_name,
+            "model_id": model_id,
+            "checkpoint_sha256": checkpoint_sha256,
+            "protocol_version": PROTOCOL,
+            "experiment": saved["experiment"],
+            "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
+        }
+
     @app.get("/arx/v3/policy-contract")
     async def policy_contract():
-        return {**saved, "model_id": model_id, "checkpoint_sha256": checkpoint_sha256,
-            "request_fields": ["raw_joint_feedback", "raw_eef_feedback", "open_baselines", "calibration_version", "experiment", "request_id", "sample_monotonic_ns", "task_instruction"],
-            "record_dir": str(record_dir)}
+        return contract_payload
 
-    @app.post("/arx/v3/action-chunks")
-    async def action_chunk(metadata: str = Form(...), head: UploadFile = File(...), left_wrist: UploadFile = File(...), right_wrist: UploadFile = File(...)):
+    @app.post("/arx/v3/sessions")
+    async def create_session(request: SessionRequest):
+        nonlocal active
+        if request.protocol_version != PROTOCOL:
+            raise HTTPException(status_code=409, detail="protocol version mismatch")
+        if request.calibration_version != VERSION:
+            raise HTTPException(status_code=409, detail="calibration version mismatch")
+        if request.client_adapter_version != CLIENT_ADAPTER_VERSION:
+            raise HTTPException(status_code=409, detail="client adapter version mismatch")
+        if request.experiment != saved["experiment"]:
+            raise HTTPException(status_code=409, detail="experiment does not match checkpoint")
+        instruction = request.task_instruction.strip()
+        if not instruction:
+            raise HTTPException(status_code=422, detail="task_instruction must not be empty")
+        if not request.client_name.strip() or not request.robot_id.strip() or not request.calibration_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="client_name, robot_id and calibration_id must not be empty",
+            )
         try:
-            raw = json.loads(metadata)
-            if not isinstance(raw, dict):
-                raise ValueError("metadata must be an object")
-            images = {name: await _read_jpeg(upload, name) for name, upload in (("head", head), ("left_wrist", left_wrist), ("right_wrist", right_wrist))}
-            adapt_request(raw, images, policy.data_spec)
-        except (ValueError, TypeError, KeyError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        with lock:
-            return infer_and_record(policy, raw, images, model_id=model_id, record_dir=record_dir)
+            opened = _validate_open_baselines(request.open_baselines)
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        session = _Session(
+            session_id=uuid.uuid4().hex,
+            task_instruction=instruction,
+            experiment=request.experiment,
+            client_name=request.client_name.strip(),
+            robot_id=request.robot_id.strip(),
+            calibration_id=request.calibration_id.strip(),
+            open_baselines=opened,
+        )
+        with state_lock:
+            active = session
+        logger.info(
+            "ARX calibrated session created: session=%s client=%s robot=%s calibration=%s",
+            session.session_id,
+            session.client_name,
+            session.robot_id,
+            session.calibration_id,
+        )
+        return {
+            "protocol_version": PROTOCOL,
+            "session_id": session.session_id,
+            "model_id": model_id,
+            "experiment": session.experiment,
+            "calibration_id": session.calibration_id,
+        }
+
+    @app.post("/arx/v3/sessions/{session_id}/action-chunks")
+    async def action_chunk(
+        session_id: str,
+        metadata: str = Form(...),
+        head: UploadFile = File(...),
+        left_wrist: UploadFile = File(...),
+        right_wrist: UploadFile = File(...),
+    ):
+        try:
+            request = json.loads(metadata)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=422, detail="metadata is not valid JSON") from error
+        if not isinstance(request, dict):
+            raise HTTPException(status_code=422, detail="metadata must be a JSON object")
+        if request.get("protocol_version") != PROTOCOL:
+            raise HTTPException(status_code=409, detail="protocol version mismatch")
+        try:
+            request_id = int(request["request_id"])
+            sample_monotonic_ns = int(request["sample_monotonic_ns"])
+            joint = _finite_vector(request.get("raw_joint_feedback"), "raw_joint_feedback")
+            eef = _finite_vector(request.get("raw_eef_feedback"), "raw_eef_feedback")
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if request_id < 1 or sample_monotonic_ns < 1:
+            raise HTTPException(
+                status_code=422,
+                detail="request_id and sample_monotonic_ns must be positive",
+            )
+        with state_lock:
+            session = active
+            if session is None or session.session_id != session_id:
+                raise HTTPException(status_code=409, detail="inactive session")
+            expected = session.last_request_id + 1
+            if request_id != expected:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"request_id {request_id} does not follow {session.last_request_id}",
+                )
+
+        images = {
+            "head": await _read_jpeg(head, "head"),
+            "left_wrist": await _read_jpeg(left_wrist, "left_wrist"),
+            "right_wrist": await _read_jpeg(right_wrist, "right_wrist"),
+        }
+        raw = {
+            "protocol_version": PROTOCOL,
+            "calibration_version": VERSION,
+            "experiment": session.experiment,
+            "request_id": request_id,
+            "sample_monotonic_ns": sample_monotonic_ns,
+            "task_instruction": session.task_instruction,
+            "raw_joint_feedback": joint,
+            "raw_eef_feedback": eef,
+            "open_baselines": session.open_baselines,
+        }
+        try:
+            payload = adapt_request(raw, images, policy.data_spec)
+        except (KeyError, TypeError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        received = datetime.now(timezone.utc).isoformat()
+        started = time.monotonic_ns()
+        with inference_lock:
+            result = policy.infer(payload)
+        inference_ms = (time.monotonic_ns() - started) / 1e6
+        actions = np.asarray(result["actions"], dtype=np.float32)
+        if actions.shape[0] != ACTION_HORIZON or actions.ndim != 2:
+            raise HTTPException(status_code=500, detail=f"policy returned invalid action shape {actions.shape}")
+        actions = actions[:, native_perm]
+        if actions.shape != (ACTION_HORIZON, ACTION_DIM) or not np.isfinite(actions).all():
+            raise HTTPException(status_code=500, detail="policy returned invalid calibrated action chunk")
+        with state_lock:
+            if active is not session:
+                raise HTTPException(status_code=409, detail="session changed during inference")
+            session.last_request_id = request_id
+
+        response = {
+            "protocol_version": PROTOCOL,
+            "calibration_version": VERSION,
+            "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
+            "session_id": session_id,
+            "request_id": request_id,
+            "sample_monotonic_ns": sample_monotonic_ns,
+            "request_received_utc": received,
+            "model_id": model_id,
+            "experiment": saved["experiment"],
+            "control_mode": saved["control_mode"],
+            "gripper_semantics": saved["gripper_action"],
+            "component_source_offsets": saved["component_source_offsets"],
+            "source_fps": saved["source_fps"],
+            "temporal_stride": saved["temporal_stride"],
+            "action_dt": 1.0 / FPS,
+            "calibrated_action_chunk": actions.tolist(),
+            "wire_action_is_robot_command": False,
+            "inference_ms": inference_ms,
+        }
+        model_record_dir.mkdir(parents=True, exist_ok=True)
+        target = model_record_dir / f"request-{request_id}-session-{session_id}.npz"
+        temporary = target.with_suffix(".tmp")
+        with temporary.open("wb") as stream:
+            np.savez_compressed(
+                stream,
+                request_json=json.dumps(
+                    {
+                        **request,
+                        "open_baselines": session.open_baselines,
+                        "task_instruction": session.task_instruction,
+                        "experiment": session.experiment,
+                        "calibration_id": session.calibration_id,
+                    },
+                    separators=(",", ":"),
+                ),
+                response_json=json.dumps(response, separators=(",", ":")),
+                raw_joint_feedback=joint,
+                raw_eef_feedback=eef,
+                open_baselines=np.asarray(
+                    [session.open_baselines["left"], session.open_baselines["right"]],
+                    dtype=np.float32,
+                ),
+                calibrated_native_state=np.asarray(payload["state"], dtype=np.float32),
+                calibrated_action_chunk=actions,
+                request_received_utc=received,
+                **{f"image_{name}": image for name, image in images.items()},
+            )
+        temporary.replace(target)
+        logger.info(
+            "ARX calibrated action chunk: session=%s request=%d sample=%d inference_ms=%.1f shape=%s",
+            session_id,
+            request_id,
+            sample_monotonic_ns,
+            inference_ms,
+            tuple(actions.shape),
+        )
+        return response
 
     return app
+
+
+__all__ = [
+    "ACTION_DIM",
+    "ACTION_HORIZON",
+    "CAMERA_NAMES",
+    "CLIENT_ADAPTER_VERSION",
+    "FPS",
+    "SUPPORTED_EXPERIMENTS",
+    "SessionRequest",
+    "adapt_request",
+    "build_calibrated_app",
+    "validate_model_contract",
+]
