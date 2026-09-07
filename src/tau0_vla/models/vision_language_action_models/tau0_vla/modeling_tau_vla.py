@@ -18,6 +18,7 @@ Key differences from LingBot VLA (Qwen2-based):
 import glob
 import os
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Optional
 
 import einops
@@ -273,9 +274,18 @@ class AdaRMSNorm(nn.Module):
         output = self._norm(hidden_states.float())
         output = output * (1.0 + self.weight.float())
         output = output.type_as(hidden_states)
-        gamma = self.gamma(cond).unsqueeze(1)
-        beta = self.beta(cond).unsqueeze(1)
-        gate = self.gate(cond).unsqueeze(1)
+        if cond.ndim == 2:
+            cond = cond.unsqueeze(1)
+        elif cond.ndim != 3:
+            raise ValueError(f"AdaRMSNorm conditioning must have shape [B, D] or [B, N, D], got {tuple(cond.shape)}")
+        if cond.shape[1] not in (1, hidden_states.shape[1]):
+            raise ValueError(
+                "Token-level AdaRMSNorm conditioning must match the hidden sequence length: "
+                f"got {cond.shape[1]} conditions for {hidden_states.shape[1]} tokens"
+            )
+        gamma = self.gamma(cond)
+        beta = self.beta(cond)
+        gate = self.gate(cond)
         output = (1 + gamma) * output + beta
         return output, gate
 
@@ -929,6 +939,8 @@ class Tau0VLAConfig(PretrainedConfig):
         tau_vla_prefix_flash_backend=False,
         action_rope_offset=0,
         use_action_mask_loss=True,
+        training_time_rtc=False,
+        rtc_max_delay=0,
         max_prefix_len=0,  # 0 = disable padding (dynamic shapes, no compile optimization)
         **kwargs,
     ):
@@ -954,7 +966,10 @@ class Tau0VLAConfig(PretrainedConfig):
         self.zero_state_emb = zero_state_emb
         self.action_rope_offset = action_rope_offset
         self.use_action_mask_loss = use_action_mask_loss
+        self.training_time_rtc = training_time_rtc
+        self.rtc_max_delay = rtc_max_delay
         self.max_prefix_len = max_prefix_len
+        self.validate_rtc_config()
         # TODO: remove this parameter once all legacy checkpoints are migrated
         if action_rope_offset != 0:
             logger.warning(
@@ -964,6 +979,23 @@ class Tau0VLAConfig(PretrainedConfig):
                 "For new training runs, set action_rope_offset=0."
             )
         super().__init__(**kwargs)
+
+    def validate_rtc_config(self):
+        """Validate the parameter-free training-time RTC configuration."""
+        if not isinstance(self.training_time_rtc, bool):
+            raise ValueError("training_time_rtc must be a boolean")
+        if isinstance(self.rtc_max_delay, bool) or not isinstance(self.rtc_max_delay, int):
+            raise ValueError("rtc_max_delay must be an integer")
+        if not (0 <= self.rtc_max_delay < self.n_action_steps):
+            raise ValueError(
+                "rtc_max_delay must satisfy 0 <= rtc_max_delay < n_action_steps "
+                f"(got rtc_max_delay={self.rtc_max_delay}, n_action_steps={self.n_action_steps})"
+            )
+        if self.training_time_rtc and self.rtc_max_delay < 1:
+            raise ValueError(
+                "training-time RTC requires 1 <= rtc_max_delay < n_action_steps "
+                f"(got rtc_max_delay={self.rtc_max_delay}, n_action_steps={self.n_action_steps})"
+            )
 
 
 # ===========================================================================
@@ -1028,6 +1060,52 @@ class FlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def sample_rtc_delay(self, bsize: int, device) -> torch.Tensor:
+        """Sample per-example delays uniformly from both endpoints of the RTC range."""
+        if not getattr(self.config, "training_time_rtc", False):
+            return torch.zeros(bsize, dtype=torch.long, device=device)
+        return torch.randint(0, self.config.rtc_max_delay + 1, (bsize,), dtype=torch.long, device=device)
+
+    def _normalize_rtc_delay(self, rtc_delay, bsize: int, device) -> torch.Tensor:
+        """Convert a scalar/``[B]`` delay to a validated integer tensor."""
+        if rtc_delay is None:
+            return torch.zeros(bsize, dtype=torch.long, device=device)
+        if isinstance(rtc_delay, bool):
+            raise ValueError("rtc_delay must be an integer scalar or an integer tensor of shape [B]")
+        if isinstance(rtc_delay, Integral):
+            delay = torch.full((bsize,), int(rtc_delay), dtype=torch.long, device=device)
+        elif torch.is_tensor(rtc_delay):
+            if rtc_delay.dtype == torch.bool or rtc_delay.dtype.is_floating_point or rtc_delay.dtype.is_complex:
+                raise ValueError("rtc_delay tensor must have an integer dtype")
+            if rtc_delay.ndim == 0:
+                delay = rtc_delay.to(device=device, dtype=torch.long).expand(bsize)
+            elif rtc_delay.ndim == 1 and rtc_delay.shape[0] == bsize:
+                delay = rtc_delay.to(device=device, dtype=torch.long)
+            else:
+                raise ValueError(f"rtc_delay must be a scalar or have shape [{bsize}], got {tuple(rtc_delay.shape)}")
+        else:
+            raise ValueError("rtc_delay must be an integer scalar or an integer tensor of shape [B]")
+
+        min_delay = int(delay.min().item())
+        max_delay = int(delay.max().item())
+        if min_delay < 0:
+            raise ValueError(f"rtc_delay must be non-negative, got minimum {min_delay}")
+        if max_delay >= self.config.n_action_steps:
+            raise ValueError(
+                f"rtc_delay must be smaller than n_action_steps={self.config.n_action_steps}, got {max_delay}"
+            )
+        if max_delay > 0 and not getattr(self.config, "training_time_rtc", False):
+            raise ValueError("positive rtc_delay requires a checkpoint/config marked training_time_rtc=true")
+        if max_delay > getattr(self.config, "rtc_max_delay", 0):
+            raise ValueError(
+                f"rtc_delay={max_delay} exceeds the checkpoint's trained rtc_max_delay={self.config.rtc_max_delay}"
+            )
+        return delay
+
+    @staticmethod
+    def _rtc_prefix_mask(delay: torch.Tensor, horizon: int) -> torch.Tensor:
+        return torch.arange(horizon, device=delay.device).unsqueeze(0) < delay.unsqueeze(1)
+
     def _allow_prefix_flash_backend(self) -> bool:
         return bool(getattr(self.config, "tau_vla_prefix_flash_backend", False)) and self.config.vlm_causal
 
@@ -1057,10 +1135,22 @@ class FlowMatching(nn.Module):
             timestep, self.config.proj_width, min_period=4e-3, max_period=4.0, device=device
         )
         time_emb = time_emb.type(dtype=dtype)
-        time_emb_ori = time_emb
-
         action_emb = self.action_in_proj(noisy_actions)
-        time_emb = einops.repeat(time_emb, "b d -> b n d", n=action_emb.shape[1])
+        if timestep.ndim == 1:
+            ada_cond = time_emb
+            time_emb = einops.repeat(time_emb, "b d -> b n d", n=action_emb.shape[1])
+        elif timestep.ndim == 2:
+            if timestep.shape != action_emb.shape[:2]:
+                raise ValueError(
+                    "Token-level timestep shape must match action tokens: "
+                    f"got {tuple(timestep.shape)}, expected {tuple(action_emb.shape[:2])}"
+                )
+            # The last action can never be part of an RTC prefix because
+            # rtc_max_delay < horizon, so it carries the unmasked global flow
+            # timestep used to condition the state token.
+            ada_cond = torch.cat([time_emb[:, -1:, :], time_emb], dim=1)
+        else:
+            raise ValueError(f"timestep must have shape [B] or [B, H], got {tuple(timestep.shape)}")
         action_time_emb = torch.cat([action_emb, time_emb], dim=-1)
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
@@ -1070,7 +1160,7 @@ class FlowMatching(nn.Module):
         embs = torch.cat([state_emb[:, None], action_time_emb], dim=1)
         pad_masks, att_masks = self._suffix_masks(bsize, action_time_dim + 1, device)
 
-        return time_emb_ori, embs, pad_masks, att_masks
+        return ada_cond, embs, pad_masks, att_masks
 
     def _build_action_prefix(
         self,
@@ -1191,6 +1281,8 @@ class FlowMatching(nn.Module):
         pixel_values_videos=None,
         video_grid_thw=None,
         action_mask=None,
+        rtc_delay=None,
+        return_postfix_mask=False,
     ) -> Tensor:
         # Cast float inputs to model dtype (e.g. bf16) for FA2 compatibility
         param_dtype = next(self.parameters()).dtype
@@ -1216,10 +1308,32 @@ class FlowMatching(nn.Module):
             noise = noise * am
         if time is None:
             time = self.sample_time(actions.size(0), device).to(dtype)
+        else:
+            if not torch.is_tensor(time) or tuple(time.shape) != (actions.size(0),):
+                shape = tuple(time.shape) if torch.is_tensor(time) else type(time).__name__
+                raise ValueError(f"time must have shape [{actions.size(0)}], got {shape}")
+            time = time.to(device=device, dtype=dtype)
+
+        postfix_mask = None
+        model_timestep = time
+        if getattr(self.config, "training_time_rtc", False):
+            if rtc_delay is None:
+                rtc_delay = self.sample_rtc_delay(actions.size(0), device)
+            else:
+                rtc_delay = self._normalize_rtc_delay(rtc_delay, actions.size(0), device)
+            prefix_mask = self._rtc_prefix_mask(rtc_delay, actions.shape[1])
+            postfix_mask = ~prefix_mask
+            model_timestep = torch.where(prefix_mask, torch.zeros_like(time[:, None]), time[:, None])
+        elif rtc_delay is not None:
+            # Explicit zero is harmless and useful to callers sharing one code path;
+            # positive conditioning is forbidden for non-RTC checkpoints.
+            self._normalize_rtc_delay(rtc_delay, actions.size(0), device)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
+        if postfix_mask is not None:
+            x_t = torch.where(postfix_mask[:, :, None], x_t, actions)
 
         prefix_embs, prefix_pad_masks, vlm_position_ids = self._build_action_prefix(
             input_ids,
@@ -1236,7 +1350,7 @@ class FlowMatching(nn.Module):
         else:
             prefix_att_masks = torch.ones(B, L, device=device, dtype=torch.bool)
 
-        time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
+        time_embs, suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, model_timestep)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -1269,7 +1383,14 @@ class FlowMatching(nn.Module):
             fm_losses = F.mse_loss(u_t, v_t, reduction="none")
         elif loss_type == "L1_fm":
             fm_losses = F.l1_loss(u_t, v_t, reduction="none")
+        else:
+            raise ValueError(f"Unsupported flow-matching loss_type: {loss_type}")
 
+        if postfix_mask is not None:
+            fm_losses = torch.where(postfix_mask[:, :, None], fm_losses, torch.zeros_like(fm_losses))
+
+        if return_postfix_mask:
+            return fm_losses, postfix_mask
         return fm_losses
 
     def sample_actions(
@@ -1283,6 +1404,8 @@ class FlowMatching(nn.Module):
         video_grid_thw=None,
         noise=None,
         action_mask=None,
+        action_prefix=None,
+        rtc_delay=None,
         timing: Optional[dict] = None,
     ) -> Tensor:
         bsize = state.shape[0]
@@ -1295,7 +1418,32 @@ class FlowMatching(nn.Module):
         if noise is None:
             actions_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
             noise = torch.randn(actions_shape, device=device, dtype=dtype)
+        elif tuple(noise.shape) != (bsize, self.config.n_action_steps, self.config.max_action_dim):
+            raise ValueError(
+                "noise must have shape "
+                f"[{bsize}, {self.config.n_action_steps}, {self.config.max_action_dim}], got {tuple(noise.shape)}"
+            )
         t1 = sync_ts(_t)
+
+        delay = self._normalize_rtc_delay(rtc_delay, bsize, device)
+        rtc_prefix_mask = None
+        if bool(torch.any(delay > 0)):
+            if action_prefix is None:
+                raise ValueError("action_prefix is required when any rtc_delay is positive")
+            if not torch.is_tensor(action_prefix):
+                raise ValueError("action_prefix must be a tensor in normalized model action space")
+            expected_prefix_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            if tuple(action_prefix.shape) != expected_prefix_shape:
+                raise ValueError(
+                    f"action_prefix must have shape {expected_prefix_shape}, got {tuple(action_prefix.shape)}"
+                )
+            action_prefix = action_prefix.to(device=device, dtype=dtype)
+            rtc_prefix_mask = self._rtc_prefix_mask(delay, self.config.n_action_steps)[:, :, None]
+        elif action_prefix is not None:
+            expected_prefix_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            if not torch.is_tensor(action_prefix) or tuple(action_prefix.shape) != expected_prefix_shape:
+                shape = tuple(action_prefix.shape) if torch.is_tensor(action_prefix) else type(action_prefix).__name__
+                raise ValueError(f"action_prefix must have shape {expected_prefix_shape}, got {shape}")
 
         # Inactive-dim train/inference consistency fix. Training only ever feeds
         # the network x_t = t*noise on inactive dims (action=0 there, FM loss
@@ -1481,7 +1629,15 @@ class FlowMatching(nn.Module):
                         x_t = x_t * inactive_mask
                     else:
                         x_t = x_t * inactive_mask + (time_val * noise) * (1 - inactive_mask)
-                timestep = time_val.expand(bsize)
+                if rtc_prefix_mask is not None:
+                    x_t = torch.where(rtc_prefix_mask, action_prefix, x_t)
+                    timestep = torch.where(
+                        rtc_prefix_mask.squeeze(-1),
+                        torch.zeros((bsize, self._n_action_steps), device=device, dtype=dtype),
+                        time_val.expand(bsize, self._n_action_steps),
+                    )
+                else:
+                    timestep = time_val.expand(bsize)
                 v_t = self._compiled_predict_velocity(
                     state, x_t, timestep, past_key_values, full_att_2d_masks, position_ids
                 )
@@ -1496,7 +1652,15 @@ class FlowMatching(nn.Module):
                         x_t = x_t * inactive_mask
                     else:
                         x_t = x_t * inactive_mask + (time * noise) * (1 - inactive_mask)
-                expanded_time = time.expand(bsize)
+                if rtc_prefix_mask is not None:
+                    x_t = torch.where(rtc_prefix_mask, action_prefix, x_t)
+                    expanded_time = torch.where(
+                        rtc_prefix_mask.squeeze(-1),
+                        torch.zeros((bsize, self._n_action_steps), device=device, dtype=dtype),
+                        time.expand(bsize, self._n_action_steps),
+                    )
+                else:
+                    expanded_time = time.expand(bsize)
                 step_timing: dict = {} if _t else None
                 v_t = self.predict_velocity(
                     state, prefix_pad_masks, past_key_values, x_t, expanded_time, timing=step_timing
@@ -1509,6 +1673,8 @@ class FlowMatching(nn.Module):
                 step_idx += 1
         if inactive_mask is not None:
             x_t = x_t * inactive_mask  # t=0 endpoint: inactive dims land at 0 in both schemes
+        if rtc_prefix_mask is not None:
+            x_t = torch.where(rtc_prefix_mask, action_prefix, x_t)
         t5 = sync_ts(_t)
 
         if _t:
@@ -1742,7 +1908,7 @@ class Tau0VLAModel(PreTrainedModel):
         if state.ndim == 3:
             state = state.squeeze(1)
 
-        fm_losses = self.flow_matching.forward(
+        fm_losses, postfix_mask = self.flow_matching.forward(
             state=state,
             actions=actions,
             input_ids=input_ids,
@@ -1752,6 +1918,10 @@ class Tau0VLAModel(PreTrainedModel):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
             loss_type=self.config.loss_type,
+            noise=kwargs.get("noise"),
+            time=kwargs.get("time"),
+            rtc_delay=kwargs.get("rtc_delay"),
+            return_postfix_mask=True,
             # Scheme C only: zero the flow input on inactive dims. Scheme A
             # (default) passes None and keeps the t*noise training input.
             action_mask=(
@@ -1764,11 +1934,20 @@ class Tau0VLAModel(PreTrainedModel):
         fm_losses = fm_losses[:, :, : self.config.action_dim]
 
         action_mask = kwargs.get("action_mask")
+        loss_mask = None
         if getattr(self.config, "use_action_mask_loss", True) and action_mask is not None:
-            mask = action_mask[:, : self.config.action_dim].unsqueeze(1)
-            fm_losses = fm_losses * mask
-            active_dims = mask.sum(dim=-1) * fm_losses.shape[1]
-            per_sample_loss = fm_losses.sum(dim=(1, 2)) / (active_dims.squeeze(-1) + 1e-8)
+            loss_mask = action_mask[:, : self.config.action_dim].unsqueeze(1).to(
+                device=fm_losses.device, dtype=fm_losses.dtype
+            )
+            loss_mask = loss_mask.expand(-1, fm_losses.shape[1], -1)
+        if postfix_mask is not None:
+            rtc_loss_mask = postfix_mask[:, :, None].to(dtype=fm_losses.dtype).expand_as(fm_losses)
+            loss_mask = rtc_loss_mask if loss_mask is None else loss_mask * rtc_loss_mask
+
+        if loss_mask is not None:
+            fm_losses = fm_losses * loss_mask
+            active_elements = loss_mask.sum(dim=(1, 2))
+            per_sample_loss = fm_losses.sum(dim=(1, 2)) / active_elements.clamp_min(1e-8)
 
             _SPIKE_THRESH = 100.0
             spike_mask = per_sample_loss > _SPIKE_THRESH
@@ -1778,7 +1957,7 @@ class Tau0VLAModel(PreTrainedModel):
                     for idx in spike_mask.nonzero(as_tuple=True)[0][:3]:
                         logger.warning(
                             f"[spike] sample {idx.item()}: loss={per_sample_loss[idx].item():.2f}, "
-                            f"active_dims={int(mask[idx].sum())}"
+                            f"active_elements={int(active_elements[idx].item())}"
                         )
             per_sample_loss = torch.clamp(per_sample_loss, max=_SPIKE_THRESH)
             vla_loss = per_sample_loss.mean()
@@ -1797,7 +1976,9 @@ class Tau0VLAModel(PreTrainedModel):
         Args:
             batch: dict with keys from ``build_vla_inference_data_dict`` plus ``state``.
                 Required: input_ids, attention_mask, state.
-                Optional: pixel_values, image_grid_thw.
+                Optional: pixel_values, image_grid_thw, action_mask. For RTC,
+                ``action_prefix`` is the normalized/padded ``[B, H, D]`` action
+                chunk and ``rtc_delay`` is an integer scalar or ``[B]`` tensor.
             timing: optional dict; when provided, per-stage latency is recorded into it.
 
         Returns:
@@ -1819,6 +2000,8 @@ class Tau0VLAModel(PreTrainedModel):
             # free integration; present -> inactive dims pinned to the training
             # input distribution each step (see sample_actions).
             action_mask=batch.get("action_mask"),
+            action_prefix=batch.get("action_prefix"),
+            rtc_delay=batch.get("rtc_delay"),
             timing=timing,
         )
         return actions[:, :, : self.config.action_dim]

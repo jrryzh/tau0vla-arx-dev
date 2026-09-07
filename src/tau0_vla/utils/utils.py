@@ -161,7 +161,7 @@ def load_config_from_yaml(yaml_path: str, overrides: dict | None = None) -> dict
 
     # Apply overrides BEFORE deriving output_dir, so a run_name override reaches it.
     _experiment_keys = {"run_name", "project_name", "cluster", "notes"}
-    _model_keys = set(config.get("model_args", {}).keys())
+    _model_keys = set(config.get("model_args", {}).keys()) | {"training_time_rtc", "rtc_max_delay"}
     _data_keys = set(config.get("data_args", {}).keys())
     for key, val in (overrides or {}).items():
         # CLI overrides always arrive as strings; coerce against the type the YAML

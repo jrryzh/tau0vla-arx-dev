@@ -81,6 +81,24 @@ class ModelArguments:
         default="fm", metadata={"help": "Loss type for VLA action prediction, e.g. 'fm' for flow matching."}
     )
     num_steps: int = field(default=10, metadata={"help": "Number of denoising steps for inference in flow matching."})
+    training_time_rtc: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable training-time real-time chunking (RTC): condition the action head on a "
+                "uniformly sampled clean action prefix. Adds no learnable parameters."
+            )
+        },
+    )
+    rtc_max_delay: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Largest action-prefix delay sampled by training-time RTC, in action timesteps. "
+                "When RTC is enabled this must satisfy 1 <= rtc_max_delay < action_horizon."
+            )
+        },
+    )
     vlm_causal: bool = field(
         default=True, metadata={"help": "Use causal (True) or bidirectional (False) prefix mask for action path."}
     )

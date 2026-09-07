@@ -93,5 +93,135 @@
     },
     "gripper_type": "raw_position",
     "is_single_arm": false
+  },
+  "arx_calibrated_joint_v1": {
+    "source": "arx-open-baseline-v1",
+    "robot_type": "ARX_LIFT2s",
+    "action_dim": 14,
+    "state_dim": 14,
+    "eef_dim": 0,
+    "action_groups": {
+      "left_arm": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "left_gripper": [
+        6
+      ],
+      "right_arm": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "right_gripper": [
+        13
+      ]
+    },
+    "state_groups": {
+      "left_arm": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "left_gripper": [
+        6
+      ],
+      "right_arm": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "right_gripper": [
+        13
+      ]
+    },
+    "gripper_type": "calibrated_feedback_state_separate_action_semantics",
+    "is_single_arm": false,
+    "eef_format": "euler"
+  },
+  "arx_calibrated_eef_v1": {
+    "source": "arx-open-baseline-v1",
+    "robot_type": "ARX_LIFT2s",
+    "action_dim": 26,
+    "state_dim": 26,
+    "eef_dim": 12,
+    "action_groups": {
+      "left_arm": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "left_gripper": [
+        6
+      ],
+      "right_arm": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "right_gripper": [
+        13
+      ]
+    },
+    "state_groups": {
+      "left_arm": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "left_gripper": [
+        6
+      ],
+      "right_arm": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "right_gripper": [
+        13
+      ]
+    },
+    "gripper_type": "calibrated_feedback_state_separate_action_semantics",
+    "is_single_arm": false,
+    "eef_format": "euler",
+    "eef_inline_indices": [
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25
+    ]
   }
 }

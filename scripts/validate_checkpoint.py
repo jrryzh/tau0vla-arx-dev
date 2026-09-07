@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--world-size", type=int, default=16)
     parser.add_argument("--expected-step", type=int)
+    parser.add_argument("--deployment", action="store_true", help="Also require weights, processor, statistics and deployment metadata")
     args = parser.parse_args()
     root = args.checkpoint.resolve()
     if not root.is_dir():
@@ -63,6 +64,28 @@ def main() -> None:
         raise SystemExit(
             f"expected {args.world_size} rank data states, found {len(data_states)}"
         )
+
+    if args.deployment:
+        deployment_files = (
+            "model.safetensors", "config.json", "processor_config.json",
+            "tokenizer.json", "policy_manifest.json", "resolved_config_full.yaml",
+        )
+        for name in deployment_files:
+            path = root / name
+            if not path.is_file() or path.stat().st_size == 0:
+                raise SystemExit(f"missing or empty deployment artifact: {name}")
+        for path in [*model, *optimizer, *data_states, *(root / name for name in required_files)]:
+            if path.stat().st_size == 0:
+                raise SystemExit(f"empty checkpoint artifact: {path.relative_to(root)}")
+        for pattern in ("spec.json", "norm_stats.json", "components.json", "field_descriptions.json"):
+            artifacts = list((root / "finch_data_spec").rglob(pattern))
+            if not artifacts:
+                raise SystemExit(f"missing deployment data contract: {pattern}")
+            for artifact in artifacts:
+                json.loads(artifact.read_text())
+        for name in ("config.json", "processor_config.json", "policy_manifest.json", "run_spec.json"):
+            json.loads((root / name).read_text())
+        print("deployment_validation=ok")
 
     print(f"checkpoint={root}")
     print(f"model_state={model[0].relative_to(root)}")

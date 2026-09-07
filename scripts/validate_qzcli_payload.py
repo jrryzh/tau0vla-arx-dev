@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 
 
@@ -20,6 +21,8 @@ def main() -> None:
     parser.add_argument("--global-batch", type=int, required=True)
     parser.add_argument("--per-device-batch", type=int, required=True)
     parser.add_argument("--gradient-accumulation", type=int, required=True)
+    parser.add_argument("--config")
+    parser.add_argument("--max-steps", type=int)
     args = parser.parse_args()
 
     text = sys.stdin.read()
@@ -49,6 +52,13 @@ def main() -> None:
     if wrong:
         raise SystemExit(f"qzcli dry-run payload mismatch: {wrong}")
     command = str(payload.get("command", ""))
+    tokens = shlex.split(command)
+    if args.config and args.config not in tokens:
+        raise SystemExit("qzcli command does not use the expected training config")
+    if args.max_steps is not None:
+        positions = [i for i, token in enumerate(tokens) if token == "--max_steps"]
+        if len(positions) != 1 or positions[0] + 1 >= len(tokens) or tokens[positions[0] + 1] != str(args.max_steps):
+            raise SystemExit("qzcli command max_steps mismatch")
     if args.repo not in command:
         raise SystemExit(
             "qzcli dry-run command does not reference the expected repository"

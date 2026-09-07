@@ -63,6 +63,17 @@ control contract. It creates one active session at a time and returns native
 - `POST /api/v1/arx-lift2s/sessions`
 - `POST /api/v1/arx-lift2s/sessions/{session_id}/action-chunks`
 
+Training-time RTC checkpoints additionally expose the compatible v2 family:
+
+- `GET /api/v2/arx-lift2s/policy-contract` reports `rtc_enabled`,
+  `rtc_max_delay`, and `rtc_delay_unit=action_steps`.
+- v2 action requests add `rtc_delay` and a compact native-ARX
+  `action_prefix` shaped `[rtc_delay, 14]`; delay zero uses an empty prefix.
+- The response echoes `rtc_delay` and always remains `[30, 14]`. The returned
+  conditioned prefix is overwritten exactly after native action permutation.
+
+The v1 routes remain available and do not require an RTC-trained checkpoint.
+
 The action-chunk endpoint accepts JSON metadata plus `head`, `left_wrist`, and
 `right_wrist` JPEG multipart fields. It validates monotonically increasing
 request IDs and echoes the request/session identity. This robot-facing API is
@@ -210,3 +221,33 @@ python3 deploy/openloop_with_server.py \
 
 For an external config module, pass `--config-module` so the same
 `@register_config` runs on the evaluation side.
+# ARX 校准协议 v3
+
+Blue/T 校准模型只开放 `/arx/v3/policy-contract` 和 `/arx/v3/action-chunks`；旧 `/act` 及 ARX v1/v2 路由不可用于这些模型。旧模型继续使用原协议。
+
+启动仍使用 `python -m deploy.server --model <checkpoint> --device cuda`。POST 请求采用 multipart：三个 JPEG 字段 `head`、`left_wrist`、`right_wrist`，以及 JSON 字符串字段 `metadata`。metadata 必须包含：
+
+```json
+{
+  "protocol_version": "arx-calibrated-v3",
+  "calibration_version": "arx-open-baseline-v1",
+  "experiment": "eef-vr",
+  "request_id": 1,
+  "sample_monotonic_ns": 123456789,
+  "task_instruction": "Pick up the T-shaped part and place it in its designated position on the board.",
+  "raw_joint_feedback": [0,0,0,0,0,0,-2,0,0,0,0,0,0,-3],
+  "raw_eef_feedback": [0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+  "open_baselines": {"left": -2, "right": -3}
+}
+```
+
+示例数值仅用于说明结构，实际请求须使用真实反馈与当前校准值。两种反馈都保持采集 14D 顺序 `[left6, gripper, right6, gripper]`。服务端扣除一次全开基线；请求不得传入已经校准的 state。`experiment` 必须匹配 checkpoint 的 joint-vr、joint-feedback 或 eef-vr。
+
+返回 `actions` 为具名分量。joint 返回左右绝对关节角；EEF 返回左右绝对 xyz 米和四元数 xyzw。左右夹爪以单列单独返回，`gripper_semantics` 明确它是 VR 闭合意图比例或基线校准后的反馈位置。`pose_convention` 保存源 RPY 约定。服务端结果始终包含 `robot_client_adapted: false`：ROS EEF 发布和 VR→底层夹爪驱动映射仍待驱动契约明确后实现。
+
+每次推理在 `outputs/arx_calibrated_inference/<model_id>/` 保存 NPZ，包含原始 joint/EEF、基线、校准后输入、三相机、动作、请求时间和模型标识。支持无需机器人在线的回放：
+
+```bash
+PYTHONPATH=src:. .venv/bin/python scripts/replay_blue_t_request.py \
+  --model <checkpoint> --request <recorded-request.npz> --out outputs/offline_replay
+```

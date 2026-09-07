@@ -24,7 +24,13 @@ import numpy as np
 import torch
 from PIL import Image as PILImage
 
-from tau0_vla.data import encode_payload, load_checkpoint_spec, load_data_spec, restore_action
+from tau0_vla.data import (
+    encode_payload,
+    encode_unified_action_prefix,
+    load_checkpoint_spec,
+    load_data_spec,
+    restore_action,
+)
 from tau0_vla.utils.run_spec import load_resolved_args
 
 
@@ -52,6 +58,16 @@ class Tau0VLAPolicy:
         # mixed-precision ckpts, otherwise matmul raises 'mat1 and mat2 must
         # have the same dtype'.
         return next(self.model.parameters()).dtype
+
+    @property
+    def rtc_enabled(self) -> bool:
+        config = getattr(getattr(self.model, "flow_matching", None), "config", None)
+        return bool(getattr(config, "training_time_rtc", False))
+
+    @property
+    def rtc_max_delay(self) -> int:
+        config = getattr(getattr(self.model, "flow_matching", None), "config", None)
+        return int(getattr(config, "rtc_max_delay", 0) or 0)
 
     @classmethod
     def from_checkpoint(
@@ -89,17 +105,58 @@ class Tau0VLAPolicy:
         return cls(model=mb.model, processor=mb.processor, data_spec=data_spec, device=torch_device)
 
     @torch.no_grad()
-    def infer(self, payload: Dict[str, Any]) -> Dict[str, np.ndarray]:
+    def infer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Native-space payload in, native-space action chunk out."""
         encoded     = encode_payload(payload, self.data_spec)
         model_input = self._tokenize_vlm(encoded)
+        meta = dict(payload.get("meta") or {})
+        delay = int(meta.get("rtc_delay", 0))
+        native_prefix = np.asarray(meta.get("action_prefix", []), dtype=np.float32)
+        encoded_prefix = None
+        if delay:
+            if not self.rtc_enabled:
+                raise ValueError("positive rtc_delay requires a training-time RTC checkpoint")
+            if delay > self.rtc_max_delay:
+                raise ValueError(
+                    f"rtc_delay={delay} exceeds the checkpoint's trained rtc_max_delay={self.rtc_max_delay}"
+                )
+            encoded_prefix = encode_unified_action_prefix(
+                payload["state"], native_prefix, self.data_spec
+            )
+            horizon = int(
+                getattr(self.model.config, "n_action_steps", self.data_spec.action_chunk_size)
+            )
+            max_dim = int(
+                getattr(
+                    self.model.flow_matching.config,
+                    "max_action_dim",
+                    encoded_prefix.shape[-1],
+                )
+            )
+            padded = torch.zeros(1, horizon, max_dim, dtype=self._model_dtype, device=self.device)
+            padded[0, :delay, : encoded_prefix.shape[-1]] = torch.as_tensor(
+                encoded_prefix, dtype=self._model_dtype, device=self.device
+            )
+            model_input["action_prefix"] = padded
+            model_input["rtc_delay"] = torch.tensor([delay], dtype=torch.long, device=self.device)
+        elif "rtc_delay" in meta:
+            model_input["rtc_delay"] = torch.zeros(1, dtype=torch.long, device=self.device)
         raw_action  = self.model.sample_action(model_input).detach().cpu().float().numpy()[0]
         # Unified routes: the relative→absolute inverse needs the ABSOLUTE
         # scattered 40D state (encode_payload's "state_abs"), not the normalized
         # model input. Component routes keep the encoded state (their
         # postprocessor un-normalizes internally).
         restore_state = encoded.get("state_abs", encoded["state"])
-        return {"actions": restore_action(raw_action, self.data_spec, state=restore_state)}
+        actions = restore_action(raw_action, self.data_spec, state=restore_state)
+        prefix_error = 0.0
+        if delay and encoded_prefix is not None:
+            decoded_prefix = restore_action(encoded_prefix, self.data_spec, state=restore_state)
+            prefix_error = float(np.max(np.abs(actions[:delay] - decoded_prefix)))
+            # Preserve the encoded prefix exactly in the policy's canonical
+            # native layout.  The HTTP layer performs the final exact overwrite
+            # after its canonical→ARX wire permutation.
+            actions[:delay] = decoded_prefix
+        return {"actions": actions, "rtc_prefix_max_abs_error": prefix_error}
 
     def _tokenize_vlm(self, encoded: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Qwen-VL chat template + pixel preprocessing + device placement."""

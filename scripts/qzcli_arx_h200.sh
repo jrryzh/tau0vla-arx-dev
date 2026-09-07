@@ -7,7 +7,7 @@ set -euo pipefail
 
 MODE=${1:-}
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 {auto|smoke|formal} [--credentials <file> | --cookie-file <file>] [--profile pickplace|tool-yipan] [--poll-seconds N]" >&2
+    echo "Usage: $0 {auto|smoke|formal} [--credentials <file> | --cookie-file <file>] [--profile pickplace|tool-yipan|pickandplace-01|pickandplace-02|0905-<dataset>-<split>[-20k]] [--poll-seconds N]" >&2
     exit 2
 fi
 shift
@@ -48,6 +48,9 @@ GLOBAL_BATCH=128
 FREE_KIB_REQUIRED=$((900 * 1024 * 1024))
 TARGET_WORKSPACE=""
 TARGET_GROUP=""
+FORMAL_STEPS=10000
+MONITOR_TO_COMPLETION=0
+RESUME_CHECKPOINT=""
 
 case "$PROFILE" in
     pickplace)
@@ -70,11 +73,61 @@ case "$PROFILE" in
         TARGET_GROUP=lcg-d8eb9030-2233-47f7-b8cb-988c3e7c0ec9
         SMOKE_ATTEMPTS=("1 16 1" "2 8 1")
         ;;
+    pickandplace-01|pickandplace-02)
+        DATASET_SUFFIX=${PROFILE#pickandplace-}
+        CONFIG="$REPO/configs/arx_lift2s_pickandplace_${DATASET_SUFFIX}/train_h200.yaml"
+        FORMAL_RUN="arx_lift2s_pickandplace_${DATASET_SUFFIX}_h200_formal"
+        FORMAL_ROOT="$REPO/outputs/$FORMAL_RUN"
+        SMOKE_ROOT="$REPO/outputs/arx_lift2s_pickandplace_${DATASET_SUFFIX}_h200_smoke"
+        MARKER="$REPO/outputs/.arx_h200_pickandplace_${DATASET_SUFFIX}_smoke_passed"
+        STATE_DIR="$REPO/outputs/qzcli_arx_h200_pickandplace_${DATASET_SUFFIX}"
+        TARGET_WORKSPACE=ws-21bd7e9f-5f97-4ffa-831e-966a436c7818
+        TARGET_GROUP=lcg-d8eb9030-2233-47f7-b8cb-988c3e7c0ec9
+        SMOKE_ATTEMPTS=("2 8 1")
+        FORMAL_STEPS=6000
+        MONITOR_TO_COMPLETION=1
+        ;;
+    0905-datasets-first50|0905-datasets-last50|0905-datasets-all100|0905-zyp-gyt-first50|0905-zyp-gyt-all100|0905-datasets-first50-20k|0905-datasets-last50-20k|0905-datasets-all100-20k|0905-zyp-gyt-first50-20k|0905-zyp-gyt-all100-20k)
+        DATASET_SUFFIX=${PROFILE//-/_}
+        CONFIG="$REPO/configs/arx_lift2s_${DATASET_SUFFIX}/train_h200.yaml"
+        FORMAL_RUN="arx_lift2s_${DATASET_SUFFIX}_h200_formal"
+        FORMAL_ROOT="$REPO/outputs/$FORMAL_RUN"
+        SMOKE_ROOT="$REPO/outputs/arx_lift2s_${DATASET_SUFFIX}_h200_smoke"
+        MARKER="$REPO/outputs/.arx_h200_${DATASET_SUFFIX}_smoke_passed"
+        STATE_DIR="$REPO/outputs/qzcli_arx_h200_${DATASET_SUFFIX}"
+        TARGET_WORKSPACE=ws-21bd7e9f-5f97-4ffa-831e-966a436c7818
+        TARGET_GROUP=lcg-d8eb9030-2233-47f7-b8cb-988c3e7c0ec9
+        SMOKE_ATTEMPTS=("2 8 1")
+        FORMAL_STEPS=10000
+        if [[ "$PROFILE" == *-20k ]]; then FORMAL_STEPS=20000; fi
+        MONITOR_TO_COMPLETION=1
+        ;;
+    0907-blue-joint-vr|0907-blue-joint-feedback|0907-blue-eef-vr|0907-t-joint-vr|0907-t-joint-feedback|0907-t-eef-vr|0907-bluet-joint-vr|0907-bluet-joint-feedback|0907-bluet-eef-vr)
+        DATASET_SUFFIX=${PROFILE//-/_}
+        CONFIG="$REPO/configs/arx_lift2s_${DATASET_SUFFIX}/train_h200.yaml"
+        FORMAL_RUN="arx_lift2s_${DATASET_SUFFIX}_h200_formal"
+        FORMAL_ROOT="$REPO/outputs/$FORMAL_RUN"
+        SMOKE_ROOT="$REPO/outputs/arx_lift2s_${DATASET_SUFFIX}_h200_smoke"
+        MARKER="$REPO/outputs/.arx_h200_${DATASET_SUFFIX}_smoke_passed"
+        STATE_DIR="$REPO/outputs/qzcli_arx_h200_${DATASET_SUFFIX}"
+        TARGET_WORKSPACE=ws-21bd7e9f-5f97-4ffa-831e-966a436c7818
+        TARGET_GROUP=lcg-d8eb9030-2233-47f7-b8cb-988c3e7c0ec9
+        SMOKE_ATTEMPTS=("2 8 1")
+        MONITOR_TO_COMPLETION=1
+        PREPARATION_ROOT="$REPO/outputs/0907_blue_t_preparation"
+        if [[ "$PROFILE" == 0907-bluet-* ]]; then PREPARATION_ROOT="$REPO/outputs/0907_bluet_mixed_preparation"; fi
+        test -f "$PREPARATION_ROOT/$PROFILE/ready.json" || { echo "Calibrated data preflight is incomplete" >&2; exit 1; }
+        ;;
     *) echo "Unknown profile: $PROFILE" >&2; exit 2 ;;
 esac
 
 FORMAL_DIR="$FORMAL_ROOT/$FORMAL_RUN"
 mkdir -p "$STATE_DIR" "$FORMAL_ROOT" "$SMOKE_ROOT"
+exec 9>"$STATE_DIR/controller.lock"
+if ! flock -n 9; then
+    echo "A controller is already running for profile $PROFILE." >&2
+    exit 1
+fi
 printf '%s\n' "$$" > "$STATE_DIR/controller.pid"
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "Missing project environment: $PYTHON_BIN (run scripts/create_venv.sh first)" >&2
@@ -84,17 +137,10 @@ fi
 LOGIN_LOG=$(mktemp)
 trap 'rm -f "$LOGIN_LOG"' EXIT
 if [ -n "$CREDENTIALS" ]; then
-    IFS= read -r QZ_USERNAME < "$CREDENTIALS"
-    QZ_PASSWORD=$(sed -n '2p' "$CREDENTIALS")
-    if [ -z "$QZ_USERNAME" ] || [ -z "$QZ_PASSWORD" ]; then
-        echo "Credential file must contain a non-empty username on line 1 and password on line 2." >&2
-        exit 2
-    fi
-    if ! printf '%s\n' "$QZ_PASSWORD" | qzcli login --username "$QZ_USERNAME" --password-stdin >"$LOGIN_LOG" 2>&1; then
-        echo "qzcli login failed (credential contents were not printed)." >&2
-        exit 1
-    fi
-    unset QZ_PASSWORD
+    "$PYTHON_BIN" "$REPO/scripts/qzcli_session.py" --credentials "$CREDENTIALS" --ensure
+    qzcli() {
+        "$PYTHON_BIN" "$REPO/scripts/qzcli_session.py" --credentials "$CREDENTIALS" -- "$@"
+    }
 else
     if ! qzcli cookie --file "$COOKIE_FILE" >"$LOGIN_LOG" 2>&1; then
         echo "qzcli cookie validation failed (cookie contents were not printed)." >&2
@@ -102,17 +148,28 @@ else
     fi
 fi
 echo "[QZCLI] Login succeeded; refreshing workspace/resource/spec cache."
+exec 8>"${HOME}/.qzcli/arx_resources.lock"
+flock 8
 RESOURCE_CACHE=${HOME}/.qzcli/resources.json
 CACHE_MAX_AGE_SECONDS=3600
 CACHE_AGE_SECONDS=$(( $(date +%s) - $(stat -c %Y "$RESOURCE_CACHE" 2>/dev/null || echo 0) ))
-if [ -s "$RESOURCE_CACHE" ] \
+if [ -n "$TARGET_WORKSPACE" ] && [ -n "$TARGET_GROUP" ] \
+    && /usr/bin/python3 "$REPO/scripts/qzcli_resource_select.py" spec "$TARGET_WORKSPACE" "$TARGET_GROUP" >/dev/null 2>&1; then
+    echo "[QZCLI] Using pinned H200 spec; availability and submission payload are checked live."
+elif [ -s "$RESOURCE_CACHE" ] \
     && [ "$CACHE_AGE_SECONDS" -ge 0 ] \
     && [ "$CACHE_AGE_SECONDS" -le "$CACHE_MAX_AGE_SECONDS" ] \
     && [ -n "$(/usr/bin/python3 "$REPO/scripts/qzcli_resource_select.py" groups)" ]; then
     echo "[QZCLI] Reusing ${CACHE_AGE_SECONDS}s-old H200 resource cache."
 else
-    qzcli workspaces --update --full --parallel 1
+    if [ -n "$TARGET_WORKSPACE" ]; then
+        qzcli workspaces --workspace "$TARGET_WORKSPACE" --update --full --parallel 1
+    else
+        qzcli workspaces --update --full --parallel 1
+    fi
 fi
+flock -u 8
+exec 8>&-
 
 select_resources() {
     local instances=$1 best_ws="" best_group="" best_free=-1 ws group output free
@@ -120,10 +177,19 @@ select_resources() {
         best_ws=$TARGET_WORKSPACE
         best_group=$TARGET_GROUP
         if ! output=$(qzcli avail --workspace "$best_ws" --group "$best_group" --nodes "$instances" --export 2>&1); then
-            return 1
+            # A pinned 6k run may wait in the scheduler queue while the user
+            # releases filler jobs. Never confuse API/auth failures with a
+            # successful resource query reporting too few idle nodes.
+            if [ "$MONITOR_TO_COMPLETION" != 1 ] || ! [[ "$output" =~ [0-9]+[[:space:]]空节点 ]]; then
+                return 1
+            fi
         fi
         best_free=$(printf '%s\n' "$output" | sed -n 's/.*[ (]\([0-9][0-9]*\) 空节点.*/\1/p' | tail -n 1)
-        [ -n "$best_free" ] && [ "$best_free" -ge "$instances" ] || return 1
+        [ -n "$best_free" ] || return 1
+        if [ "$best_free" -lt "$instances" ]; then
+            [ "$MONITOR_TO_COMPLETION" = 1 ] || return 1
+            echo "[QZCLI] $best_free idle nodes; submitting to the pinned scheduler queue for $instances nodes."
+        fi
     else
         while IFS=$'\t' read -r ws group; do
             [ -n "$ws" ] || continue
@@ -162,26 +228,37 @@ wait_for_resources() {
 }
 
 validate_dry_run() {
-    local text=$1 instances=$2 batch=$3 accum=$4 world_size
+    local text=$1 instances=$2 batch=$3 accum=$4 steps=$5 world_size
     world_size=$((instances * GPUS_PER_NODE))
     printf '%s' "$text" | "$PYTHON_BIN" "$REPO/scripts/validate_qzcli_payload.py" \
         --compute-group "$SELECTED_GROUP" --spec "$SELECTED_SPEC" --repo "$REPO" \
         --instances "$instances" --gpus-per-node "$GPUS_PER_NODE" --shm-gi "$SHM_GI" \
         --world-size "$world_size" --global-batch "$GLOBAL_BATCH" \
-        --per-device-batch "$batch" --gradient-accumulation "$accum"
+        --per-device-batch "$batch" --gradient-accumulation "$accum" \
+        --config "$CONFIG" --max-steps "$steps"
 }
 
 submit_job() {
-    local name=$1 command=$2 instances=$3 batch=$4 accum=$5 dry actual
+    local name=$1 command=$2 instances=$3 batch=$4 accum=$5 steps=$6 dry actual
+    if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ -s "$STATE_DIR/pending_submission.json" ]; then
+        echo "An earlier submission has an uncertain outcome; reconcile its exact name before submitting again." >&2
+        return 1
+    fi
     local -a args=(
         --name "$name" --command "$command"
         --workspace "$SELECTED_WORKSPACE" --compute-group "$SELECTED_GROUP"
         --spec "$SELECTED_SPEC" --gpu-type NVIDIA_H200_SXM_141G
         --cpu "$SELECTED_CPU" --gpus "$GPUS_PER_NODE" --memory "$SELECTED_MEMORY"
-        --instances "$instances" --shm "$SHM_GI" --framework pytorch
+        --instances "$instances" --shm "$SHM_GI" --framework pytorch --priority 10
     )
     dry=$(qzcli create "${args[@]}" --dry-run) || return 1
-    validate_dry_run "$dry" "$instances" "$batch" "$accum" || return 1
+    validate_dry_run "$dry" "$instances" "$batch" "$accum" "$steps" || return 1
+    if [ "$MONITOR_TO_COMPLETION" = 1 ]; then
+        "$PYTHON_BIN" - "$name" "$steps" "$STATE_DIR/pending_submission.json" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[3]).write_text(json.dumps({"name": sys.argv[1], "steps": int(sys.argv[2])}) + "\n")
+PY
+    fi
     actual=$(qzcli create "${args[@]}" --json) || return 1
     printf '%s\n' "$actual" > "$STATE_DIR/${name}_submit.log"
     printf '%s' "$actual" | "$PYTHON_BIN" -c '
@@ -190,7 +267,7 @@ lines = [line for line in sys.stdin.read().splitlines() if line.lstrip().startsw
 if not lines:
     raise SystemExit("qzcli create did not return JSON")
 print(json.loads(lines[-1])["job_id"])
-'
+' || return 1
 }
 
 job_status() {
@@ -258,6 +335,13 @@ wait_for_smoke() {
         --gpus-per-node "$GPUS_PER_NODE" --shm-gi "$SHM_GI"
         --world-size "$world_size" --global-batch "$GLOBAL_BATCH"
     )
+    if [[ "$PROFILE" == 0907-* ]]; then
+        validator_args+=(--require-all-parameters)
+        if find "$run_dir" -type f \( -name 'model.safetensors' -o -name '*optim_states.pt' -o -name 'pytorch_model.bin' \) -print -quit | grep -q .; then
+            echo "Calibrated smoke unexpectedly saved weights or optimizer state" >&2
+            return 1
+        fi
+    fi
     for ((index = 0; index < instances; index++)); do
         validator_args+=(--worker-log "$STATE_DIR/${job_id}_worker-${index}_success.log")
     done
@@ -285,7 +369,10 @@ remote_command() {
         run_name=$FORMAL_RUN
         output_root=$FORMAL_ROOT
         auto_resume=1
-        max_steps=10000
+        max_steps=$FORMAL_STEPS
+        if [ "$MONITOR_TO_COMPLETION" = 1 ]; then
+            auto_resume=0
+        fi
         save_strategy=steps
         skip_final_save=0
     fi
@@ -293,16 +380,38 @@ remote_command() {
         "$REPO" "$instances" "$GPUS_PER_NODE" "$output_root" "$FREE_KIB_REQUIRED" \
         "$PYTHON_BIN" "$auto_resume" "$skip_final_save" "$world_size" "$GLOBAL_BATCH" "$CONFIG" "$run_name" \
         "$output_root" "$max_steps" "$batch" "$accum" "$save_strategy"
+    if [ "$kind" = formal ] && [ -n "$RESUME_CHECKPOINT" ]; then
+        printf ' --resume_from_checkpoint %q' "$RESUME_CHECKPOINT"
+    fi
 }
 
 run_smoke() {
     local attempt instances batch accum command name job_id logs
+    if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ -s "$STATE_DIR/smoke_job_id" ]; then
+        job_id=$(cat "$STATE_DIR/smoke_job_id")
+        case "$(job_status "$job_id")" in
+            *running*|*queuing*|*succeeded*)
+                SELECTED_WORKSPACE=$TARGET_WORKSPACE
+                SELECTED_GROUP=$TARGET_GROUP
+                if wait_for_smoke "$job_id" 2 8; then
+                    printf 'profile=%s\ninstances=2\nworld_size=16\nbatch=8\naccumulation=1\njob_id=%s\n' \
+                        "$PROFILE" "$job_id" > "$MARKER"
+                    echo "[SMOKE] Accepted existing job=$job_id."
+                    return 0
+                fi
+                return 1
+                ;;
+            *) echo "Existing smoke needs reconciliation before another submission: $job_id" >&2; return 1 ;;
+        esac
+    fi
     for attempt in "${SMOKE_ATTEMPTS[@]}"; do
         read -r instances batch accum <<< "$attempt"
         wait_for_resources "$instances"
         command=$(remote_command smoke "$instances" "$batch" "$accum")
         name="arx-${PROFILE}-h200-smoke-${instances}x8-b${batch}-$(date +%m%d-%H%M%S)"
-        job_id=$(submit_job "$name" "$command" "$instances" "$batch" "$accum")
+        job_id=$(submit_job "$name" "$command" "$instances" "$batch" "$accum" 20) || return 1
+        printf '%s\n' "$job_id" > "$STATE_DIR/smoke_job_id"
+        rm -f "$STATE_DIR/pending_submission.json"
         echo "[SMOKE] Submitted $job_id (instances=$instances, world_size=$((instances * GPUS_PER_NODE)), batch=$batch, accumulation=$accum)."
         if wait_for_smoke "$job_id" "$instances" "$batch"; then
             printf 'profile=%s\ninstances=%s\nworld_size=%s\nbatch=%s\naccumulation=%s\njob_id=%s\n' \
@@ -356,34 +465,91 @@ run_formal() {
         echo "Invalid or mismatched smoke marker: $MARKER" >&2
         return 1
     fi
+    if [ "$MONITOR_TO_COMPLETION" = 1 ] \
+        && { [ "$instances" != 2 ] || [ "$batch" != 8 ] || [ "$accum" != 1 ]; }; then
+        echo "This profile requires exactly 16 GPUs, batch 8, accumulation 1." >&2
+        return 1
+    fi
     if [ "$(df -Pk "$FORMAL_ROOT" | awk 'NR==2 {print $4}')" -lt "$FREE_KIB_REQUIRED" ]; then
         echo "Formal output filesystem has less than 900 GiB free." >&2
         return 1
     fi
-    wait_for_resources "$instances"
-    command=$(remote_command formal "$instances" "$batch" "$accum")
-    name="arx-${PROFILE}-h200-formal-10k-$(date +%m%d-%H%M%S)"
-    job_id=$(submit_job "$name" "$command" "$instances" "$batch" "$accum")
-    printf '%s\n' "$job_id" > "$STATE_DIR/formal_job_id"
-    echo "[FORMAL] Submitted $job_id. Waiting for checkpoint-500 and a later optimization step."
-    echo "[FORMAL] https://qz.sii.edu.cn/jobs/distributedTrainingDetail/$job_id?spaceId=$SELECTED_WORKSPACE"
+    job_id=""
+    if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ -s "$STATE_DIR/formal_job_id" ]; then
+        job_id=$(cat "$STATE_DIR/formal_job_id")
+        status=$(job_status "$job_id")
+        case "$status" in
+            *failed*|*stopped*|*error*) job_id="" ;;
+            unknown|"") echo "Cannot establish previous job status; refusing duplicate submission." >&2; return 1 ;;
+            *) echo "[FORMAL] Continuing to monitor existing job $job_id ($status)." ;;
+        esac
+    fi
+    if [ -z "$job_id" ]; then
+        if [ "$MONITOR_TO_COMPLETION" = 1 ]; then
+            RESUME_CHECKPOINT=$("$PYTHON_BIN" "$REPO/scripts/select_arx_resume_checkpoint.py" \
+                "$FORMAL_DIR" --config "$CONFIG" --world-size "$world_size")
+        fi
+        wait_for_resources "$instances"
+        command=$(remote_command formal "$instances" "$batch" "$accum")
+        name="arx-${PROFILE}-h200-formal-$((FORMAL_STEPS / 1000))k-$(date +%m%d-%H%M%S)"
+        job_id=$(submit_job "$name" "$command" "$instances" "$batch" "$accum" "$FORMAL_STEPS") || return 1
+        printf '%s\n' "$job_id" > "$STATE_DIR/formal_job_id"
+        rm -f "$STATE_DIR/pending_submission.json"
+        echo "[FORMAL] Submitted $job_id. Waiting for checkpoint-500 and a later optimization step."
+        echo "[FORMAL] https://qz.sii.edu.cn/jobs/distributedTrainingDetail/$job_id?spaceId=$SELECTED_WORKSPACE"
+    fi
     checkpoint="$FORMAL_DIR/checkpoint-500"
     latest="$STATE_DIR/${job_id}_latest.log"
+    local checkpoint_500_accepted=0
+    if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ -f "$STATE_DIR/checkpoint_500_accepted" ] \
+        && [ "$(cat "$STATE_DIR/checkpoint_500_accepted")" = "$FORMAL_RUN:$FORMAL_STEPS" ]; then
+        # A 20k run retaining 20 saves rotates checkpoint-500 out after step
+        # 10000. Preserve its already-validated acceptance across restarts.
+        checkpoint_500_accepted=1
+    fi
+    local -a durable_logs
     while true; do
         qzcli logs "$job_id" --tail 300 > "$latest" 2>&1 || true
-        if "$PYTHON_BIN" "$REPO/scripts/validate_checkpoint.py" "$checkpoint" \
+        # Durable logs retain the continuation evidence after server tails roll over.
+        mapfile -t durable_logs < <(find "$FORMAL_DIR/log" -maxdepth 1 -name 'training_log_nodeIdx000_*.txt' -type f 2>/dev/null | sort)
+        if [ "${#durable_logs[@]}" -gt 0 ]; then
+            cat "${durable_logs[@]}" >> "$latest"
+        fi
+        if [ "$checkpoint_500_accepted" = 0 ] && "$PYTHON_BIN" "$REPO/scripts/validate_checkpoint.py" "$checkpoint" \
             --world-size "$world_size" --expected-step 500 > "$STATE_DIR/checkpoint_500_validation.log" 2>&1 \
             && log_has_step_after_500 "$latest"; then
             cat "$STATE_DIR/checkpoint_500_validation.log"
             echo "[FORMAL] checkpoint-500 accepted and training continued beyond step 500 for job $job_id."
-            return 0
+            checkpoint_500_accepted=1
+            if [ "$MONITOR_TO_COMPLETION" = 1 ]; then
+                printf '%s:%s\n' "$FORMAL_RUN" "$FORMAL_STEPS" > "$STATE_DIR/checkpoint_500_accepted"
+            fi
+            if [ "$MONITOR_TO_COMPLETION" = 0 ]; then
+                return 0
+            fi
+        fi
+        if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ "${#durable_logs[@]}" -gt 0 ]; then
+            "$PYTHON_BIN" "$REPO/scripts/plot_training_live.py" --log-dir "$FORMAL_DIR/log" \
+                --output-dir "$STATE_DIR/dashboard" > "$STATE_DIR/dashboard.log" 2>&1 || true
         fi
         status=$(job_status "$job_id" || true)
-        echo "[FORMAL] job=$job_id status=$status checkpoint_500_or_continuation=pending"
+        echo "[FORMAL] job=$job_id status=$status checkpoint_500_accepted=$checkpoint_500_accepted target_steps=$FORMAL_STEPS"
         case "$status" in
-            *failed*|*stopped*|*error*|*succeeded*)
+            *succeeded*)
+                if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ "$checkpoint_500_accepted" = 1 ]; then
+                    "$PYTHON_BIN" "$REPO/scripts/validate_checkpoint.py" "$FORMAL_DIR/checkpoint-$FORMAL_STEPS" \
+                        --world-size "$world_size" --expected-step "$FORMAL_STEPS" --deployment \
+                        | tee "$STATE_DIR/checkpoint_${FORMAL_STEPS}_validation.log"
+                    printf '%s\n' "$job_id" > "$STATE_DIR/completed_job_id"
+                    echo "[FORMAL] Completed and validated $FORMAL_STEPS steps: $FORMAL_DIR/checkpoint-$FORMAL_STEPS"
+                    return 0
+                fi
+                echo "Formal job succeeded without verified checkpoint continuation." >&2
+                return 1
+                ;;
+            *failed*|*stopped*|*error*)
                 qzcli logs "$job_id" --tail 1000 > "$STATE_DIR/${job_id}_terminal.log" 2>&1 || true
-                echo "Formal job became terminal before checkpoint-500 continuation was verified." >&2
+                echo "Formal job interrupted. Rerun formal to resume this profile's last complete checkpoint." >&2
                 return 1
                 ;;
         esac
@@ -394,5 +560,12 @@ run_formal() {
 case "$MODE" in
     smoke) run_smoke ;;
     formal) run_formal ;;
-    auto) run_smoke && run_formal ;;
+    auto)
+        if [ "$MONITOR_TO_COMPLETION" = 1 ] && [ -f "$MARKER" ]; then
+            run_formal
+        else
+            run_smoke
+            run_formal
+        fi
+        ;;
 esac

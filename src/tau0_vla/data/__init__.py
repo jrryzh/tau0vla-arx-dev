@@ -14,6 +14,7 @@ from tau0_vla.data.config import register_config, register_repo_ids
 from tau0_vla.data.data_spec import (
     action_slices,
     detect_quat_order,
+    encode_unified_action_prefix,
     encode_payload,
     encode_state,
     load_data_spec,
@@ -83,6 +84,7 @@ __all__ = [
     "detect_quat_order",
     "encode_payload",
     "encode_state",
+    "encode_unified_action_prefix",
     "get_transform",
     "list_registered_transforms",
     "load_aid_episode_id_mapping",

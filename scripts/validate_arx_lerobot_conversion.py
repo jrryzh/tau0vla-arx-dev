@@ -107,11 +107,19 @@ def _validate_videos(root: Path, expected_frames: int) -> None:
                     raise ValueError(
                         f"{path}: unexpected video FPS {stream.average_rate}"
                     )
-                for frame in container.decode(stream):
-                    shape = frame.to_ndarray(format="rgb24").shape
-                    if shape != IMAGE_SHAPE:
-                        raise ValueError(f"{path}: decoded video frame as {shape}")
-                    frames += 1
+                file_frames = 0
+                try:
+                    for frame in container.decode(stream):
+                        shape = frame.to_ndarray(format="rgb24").shape
+                        if shape != IMAGE_SHAPE:
+                            raise ValueError(f"{path}: decoded video frame as {shape}")
+                        frames += 1
+                        file_frames += 1
+                except av.error.FFmpegError as exc:
+                    raise ValueError(
+                        f"{path}: video decode failed after {file_frames} file frames "
+                        f"({frames} total camera frames)"
+                    ) from exc
         if frames != expected_frames:
             raise ValueError(
                 f"{camera}: decoded {frames} frames, expected {expected_frames}"

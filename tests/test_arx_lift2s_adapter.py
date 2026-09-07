@@ -22,7 +22,7 @@ from tau0_vla.adapters.arx_lift2s.deploy_io import (
 )
 from tau0_vla.data.modalities import ArmJoint, Gripper
 from tau0_vla.data.checkpoint_spec import load_checkpoint_spec
-from tau0_vla.data.data_spec import build_unified_state_encoder
+from tau0_vla.data.data_spec import build_unified_action_prefix_encoder, build_unified_state_encoder
 
 
 def _config() -> ArxLift2sUnified:
@@ -216,6 +216,37 @@ class ArxContractTest(unittest.TestCase):
         self.assertEqual(encoded["state"].shape, (40,))
         self.assertEqual(encoded["state_abs"].shape, (40,))
         self.assertEqual(int(encoded["state_mask"].sum()), 14)
+
+    def test_serving_action_prefix_encoder_round_trip(self):
+        stats = {
+            "mean": [0.0] * 40,
+            "std": [1.0] * 40,
+            "q01": [-1.0] * 40,
+            "q99": [1.0] * 40,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            stats_path = Path(directory) / "norm_stats.json"
+            stats_path.write_text(json.dumps({
+                "format_version": 2,
+                "norm_stats": {"state": stats, "action": stats},
+                "per_embodiment": {"arx_lift2s_14": {"state": stats, "action": stats}},
+                "config_summary": {},
+            }))
+            spec = SimpleNamespace(
+                finch_config_name="arx_rtc_prefix_test",
+                artifacts_dir=directory,
+                config_modules=(),
+                unified_registry_key="arx_lift2s_14",
+                unified_has_eef=False,
+                norm_stats_path=str(stats_path),
+                action_dim=40,
+            )
+            state = np.arange(14, dtype=np.float32)
+            prefix = np.stack((state + 0.1, state + 0.2)).astype(np.float32)
+            encoded_state = build_unified_state_encoder(spec)(state)
+            encoded_prefix = build_unified_action_prefix_encoder(spec)(state, prefix)
+            decoded = restore_native_action(encoded_prefix, spec, state_abs=encoded_state["state_abs"])
+        np.testing.assert_allclose(decoded, prefix, atol=1e-6)
 
     def test_dataset_contract_accepts_exact_schema(self):
         with tempfile.TemporaryDirectory() as directory:

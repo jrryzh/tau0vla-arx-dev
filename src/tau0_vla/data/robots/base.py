@@ -157,6 +157,7 @@ class RobotConfig:
     state: Sequence[ComponentSpec] | None = None
     action: Sequence[ComponentSpec] | None = None
     action_horizon: int | None = None
+    deployment_contract: dict[str, Any] | None = None
     action_semantics: str | None = None
     action_offset_frames: int | None = None
     prompt_source: PromptSource | None = None
