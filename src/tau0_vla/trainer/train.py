@@ -271,6 +271,10 @@ def _require_all_training_groups(model, model_args) -> None:
         if frozen:
             raise RuntimeError(f"Required trainable group {name} has {frozen:,} frozen parameters")
         logging.info("Trainable group verified: %s=%s parameters", name, f"{sum(p.numel() for p in params):,}")
+    frozen_names = [name for name, parameter in model.named_parameters() if not parameter.requires_grad]
+    if frozen_names:
+        raise RuntimeError(f"Full-parameter launch contains frozen parameters: {frozen_names[:20]}")
+    logging.info("All parameters trainable verified: %s parameters", sum(p.numel() for p in model.parameters()))
 
 
 def train():

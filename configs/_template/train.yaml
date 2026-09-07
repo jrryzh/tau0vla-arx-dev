@@ -30,6 +30,11 @@ model_args:
   tune_vla_dit: true
   loss_type: fm
   num_steps: 10
+  # Training-time real-time chunking. When enabled, rtc_max_delay is sampled
+  # uniformly from [0, rtc_max_delay] per example and must be smaller than the
+  # action_horizon declared in data.py.
+  training_time_rtc: false
+  rtc_max_delay: 0
   vlm_causal: true
   tau_vla_prefix_flash_backend: true
   vla_inactive_input_zero: true

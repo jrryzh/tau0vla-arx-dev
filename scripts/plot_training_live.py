@@ -41,15 +41,15 @@ def parse_logs(paths: list[Path]) -> tuple[list[dict[str, float]], int | None]:
     """Parse metric dictionaries, associating each with the preceding progress step."""
     rows_by_step: dict[int, dict[str, float]] = {}
     texts = [path.read_text(encoding="utf-8", errors="replace").replace("\r", "\n") for path in paths]
-    # NCCL and other runtime messages contain ratios such as ``12/0`` and
-    # ``1/1``.  The tqdm training denominator is the largest denominator in the
-    # rank-0 log, so resolve it once and ignore unrelated ratios below.
+    # Dataset-loading bars can be longer than training itself. Prefer the
+    # explicit launch budget, falling back to progress bars for legacy logs.
+    launch_budgets = [int(value) for text in texts for value in re.findall(r"--max_steps(?:\s+|=)(\d+)", text)]
     denominators = [
         int(match.group(2))
         for text in texts
         for match in PROGRESS_RE.finditer(text)
     ]
-    total_steps = max(denominators, default=None)
+    total_steps = launch_budgets[-1] if launch_budgets else max(denominators, default=None)
     for text in texts:
         current_step: int | None = None
         for chunk in text.splitlines():
@@ -61,14 +61,17 @@ def parse_logs(paths: list[Path]) -> tuple[list[dict[str, float]], int | None]:
             if progress:
                 current_step = int(progress[-1].group(1))
             for match in METRIC_RE.finditer(chunk):
-                if current_step is None:
-                    continue
                 try:
                     metrics = ast.literal_eval(match.group(0))
                 except (SyntaxError, ValueError):
                     continue
-                rows_by_step[current_step] = {
-                    "step": current_step,
+                # Metrics can be printed before tqdm advances to the same step.
+                step = metrics.get("global_step", current_step)
+                if step is None:
+                    continue
+                step = int(step)
+                rows_by_step[step] = {
+                    "step": step,
                     **{name: _as_float(metrics.get(name)) for name in FIELDS[1:]},
                 }
     return [rows_by_step[step] for step in sorted(rows_by_step)], total_steps

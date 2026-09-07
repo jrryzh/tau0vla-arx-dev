@@ -176,6 +176,8 @@ class ModelBuilder:
         train_state_proj = getattr(self.model_args, "train_state_proj", False)
         loss_type = getattr(self.model_args, "loss_type", "fm")
         num_steps = getattr(self.model_args, "num_steps", 10)
+        training_time_rtc = getattr(self.model_args, "training_time_rtc", False)
+        rtc_max_delay = getattr(self.model_args, "rtc_max_delay", 0)
 
         if getattr(cfg, "model_type", None) == "tau_vla":
             # SFT from a trained VLA checkpoint — from_pretrained loads all weights
@@ -229,6 +231,9 @@ class ModelBuilder:
             cfg.tau_vla_prefix_flash_backend = getattr(self.model_args, "tau_vla_prefix_flash_backend", False)
             cfg.use_action_mask_loss = getattr(self.model_args, "use_action_mask_loss", True)
             cfg.vla_inactive_input_zero = getattr(self.model_args, "vla_inactive_input_zero", False)
+            cfg.training_time_rtc = training_time_rtc
+            cfg.rtc_max_delay = rtc_max_delay
+            cfg.validate_rtc_config()
             cfg.loss_type = loss_type
             cfg.num_steps = num_steps
             self.model = Tau0VLAModel.from_pretrained(backbone_path, config=cfg)
@@ -266,6 +271,8 @@ class ModelBuilder:
                 zero_state_emb=getattr(self.model_args, "zero_state_emb", False),
                 use_action_mask_loss=getattr(self.model_args, "use_action_mask_loss", True),
                 vla_inactive_input_zero=getattr(self.model_args, "vla_inactive_input_zero", False),
+                training_time_rtc=training_time_rtc,
+                rtc_max_delay=rtc_max_delay,
                 loss_type=loss_type,
                 num_steps=num_steps,
             )

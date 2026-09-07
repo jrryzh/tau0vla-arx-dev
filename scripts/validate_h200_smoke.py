@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import math
 import re
 from pathlib import Path
 
@@ -48,6 +50,7 @@ def main() -> None:
     parser.add_argument("--global-batch", type=int, required=True)
     parser.add_argument("--worker-log", action="append", type=Path, required=True)
     parser.add_argument("--training-log", action="append", type=Path, required=True)
+    parser.add_argument("--require-all-parameters", action="store_true")
     args = parser.parse_args()
 
     status = _load_last_json(args.status_json)
@@ -86,6 +89,7 @@ def main() -> None:
         values = [int(value) for value in re.findall(r"\[H200_PEAK_MEMORY\] peak_mib=(\d+)", text)]
         _require(bool(values), f"missing peak-memory evidence in {path}")
         peaks.append(max(values))
+    _require(all(0 < peak < 145000 for peak in peaks), "invalid H200 peak memory evidence")
 
     _require(len(args.training_log) >= args.instances, "durable training log count mismatch")
     training_text = "\n".join(path.read_text(errors="replace") for path in args.training_log)
@@ -97,12 +101,27 @@ def main() -> None:
     )
     groups = set(re.findall(r"Trainable group verified: ([a-z_]+)=", evidence))
     _require(TRAINABLE_GROUPS <= groups, "not all four model groups were trainable")
+    if args.require_all_parameters:
+        _require("All parameters trainable verified:" in evidence, "full model trainability check missing")
     _require("'loss':" in evidence, "loss metric is missing")
     _require("'grad_norm':" in evidence, "gradient norm is missing")
     _require("'train_runtime':" in evidence, "completed training summary is missing")
     _require("'global_step': 20" in evidence, "smoke did not complete step 20")
+    metric_rows = []
+    for line in evidence.replace("\r", "\n").splitlines():
+        if "'loss':" not in line or "'grad_norm':" not in line:
+            continue
+        try:
+            row = ast.literal_eval(line[line.index("{"):line.rindex("}")+1])
+        except (ValueError, SyntaxError):
+            continue
+        metric_rows.append(row)
+    _require(bool(metric_rows), "no parseable loss/gradient metrics")
+    _require(all(math.isfinite(float(row[key])) for row in metric_rows for key in ("loss", "grad_norm")), "nonfinite loss or gradient")
     failure = re.search(
-        r"out of memory|\bnan\b|nccl[^\n]*(?:timeout|error)|traceback",
+        # NCCL prints configuration names such as NCCL_IB_TIMEOUT at INFO
+        # level during successful startup. Match error words, not identifiers.
+        r"out of memory|\bnan\b|nccl[^\n]*\b(?:timeout|timed out|error)\b|traceback",
         evidence,
         flags=re.IGNORECASE,
     )

@@ -87,6 +87,10 @@ def build_app(
 ) -> FastAPI:
     from tau0_vla.data import action_slices as _action_slices
 
+    if getattr(policy.data_spec, "deployment_contract", None) is not None:
+        from deploy.arx_calibrated_http import build_calibrated_app
+        return build_calibrated_app(policy, model_id=model_id, checkpoint_sha256=checkpoint_sha256,
+                                    allowed_client_ips=allowed_client_ips)
     _require_public_v1_joint_only(policy.data_spec)
     # Embodiment-specific wire knowledge (SDK payload keys, camera aliases,
     # state channel map, SDK action column order) lives in layer 3 of an
@@ -227,7 +231,11 @@ def main() -> None:
     discover_checkpoint_config_modules(args.model)
 
     policy = Tau0VLAPolicy.from_checkpoint(args.model, route=args.route, device=args.device)
-    _require_public_v1_joint_only(policy.data_spec)
+    if getattr(policy.data_spec, "deployment_contract", None) is None:
+        _require_public_v1_joint_only(policy.data_spec)
+    else:
+        from deploy.arx_calibrated_http import validate_model_contract
+        validate_model_contract(policy.data_spec)
     logger.info("route=%s", policy.data_spec.finch_config_name)
 
     _configure_inference_mode(policy, args.infer_mode, args.max_prefix_len)

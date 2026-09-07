@@ -85,6 +85,7 @@ class FinchDataSpec:
     unified_has_eef: bool = True
     action_semantics: str | None = None
     action_offset_frames: int | None = None
+    deployment_contract: dict[str, Any] | None = None
 
     def format_instruction(self, task_description: str) -> str:
         # Delegate to ``Prompt.format`` so named placeholders (``{instruction}``
@@ -264,6 +265,8 @@ def _build_data_spec(
     if unified_registry_key is not None:
         eef_provider = rc._eef_provider() if hasattr(rc, "_eef_provider") else None
         unified_has_eef = (getattr(rc, "_eef_action_col", None) is not None) or (eef_provider is not None)
+    if unified_registry_key is not None:
+        is_eef = unified_has_eef
     return FinchDataSpec(
         format_version=FORMAT_VERSION,
         robot_name=exemplar.robot_config.robot_name,
@@ -296,6 +299,7 @@ def _build_data_spec(
         unified_has_eef=unified_has_eef,
         action_semantics=exemplar.action_semantics,
         action_offset_frames=exemplar.action_offset_frames,
+        deployment_contract=getattr(rc, "deployment_contract", None),
     )
 
 
@@ -676,6 +680,7 @@ def _load_persisted_data_spec(
         unified_has_eef=bool(payload.get("unified_has_eef", True)),
         action_semantics=payload.get("action_semantics"),
         action_offset_frames=payload.get("action_offset_frames"),
+        deployment_contract=payload.get("deployment_contract"),
     )
 
 
@@ -1136,6 +1141,7 @@ def encode_state(raw_state: np.ndarray, data_spec: "FinchDataSpec") -> np.ndarra
 
 
 _unified_state_encoder_cache: dict[tuple, Any] = {}
+_unified_action_prefix_encoder_cache: dict[tuple, Any] = {}
 
 
 def _build_unified_assembler(
@@ -1197,6 +1203,11 @@ def _build_unified_assembler(
         has_eef_state = has_eef_action = bool(data_spec.unified_has_eef)
         eef_format = str(entry.get("eef_format") or "euler")
         is_single_arm = bool(entry.get("is_single_arm", False))
+        robot_cls = getattr(data_spec, "robot_cls", None)
+        if robot_cls is not None:
+            robot_config = robot_cls(repo_id="unused")
+            if hasattr(robot_config, "_eef_provider"):
+                eef_provider = robot_config._eef_provider()
 
     if has_eef_state and eef_provider is None:
         raise NotImplementedError(
@@ -1299,6 +1310,68 @@ def build_unified_state_encoder(data_spec: "FinchDataSpec"):
 
     _unified_state_encoder_cache[cache_key] = _encode
     return _encode
+
+
+def build_unified_action_prefix_encoder(data_spec: "FinchDataSpec"):
+    """Build the deploy forward for a compact native action prefix.
+
+    The callable accepts the *current* native state and ``[delay, native_dim]``
+    absolute actions, then runs the same scatter, relative-action transform and
+    normalization as training.  It intentionally returns only the compact
+    prefix; callers pad it to the model's fixed action horizon.
+    """
+    cache_key = (data_spec.finch_config_name or "", data_spec.artifacts_dir or "")
+    if cache_key in _unified_action_prefix_encoder_cache:
+        return _unified_action_prefix_encoder_cache[cache_key]
+    if data_spec.unified_registry_key is None:
+        raise ValueError("build_unified_action_prefix_encoder called on a non-unified data_spec")
+
+    from tau0_vla.data.robots.unified import get_registry_entry
+
+    assembler, _config = _build_unified_assembler(
+        data_spec,
+        caller="build_unified_action_prefix_encoder",
+        resolve_config=False,
+    )
+    entry = get_registry_entry(data_spec.unified_registry_key)
+    native_state_dim = int(entry.get("state_dim") or 0)
+    native_action_dim = int(entry.get("action_dim") or 0)
+
+    def _encode(raw_state: np.ndarray, raw_action_prefix: np.ndarray) -> np.ndarray:
+        state = np.asarray(raw_state, dtype=np.float32)
+        prefix = np.asarray(raw_action_prefix, dtype=np.float32)
+        if state.shape != (native_state_dim,) or not np.isfinite(state).all():
+            raise ValueError(f"raw_state must be a finite {native_state_dim}-vector")
+        if (
+            prefix.ndim != 2
+            or prefix.shape[1:] != (native_action_dim,)
+            or not np.isfinite(prefix).all()
+        ):
+            raise ValueError(
+                "raw_action_prefix must be a finite "
+                f"[delay, {native_action_dim}] array, got {prefix.shape}"
+            )
+        result = assembler(
+            {
+                "_state_raw": state,
+                "_action_raw": prefix,
+                "prompt": "",
+                "images": {},
+            }
+        )
+        return np.asarray(result["action"], dtype=np.float32)
+
+    _unified_action_prefix_encoder_cache[cache_key] = _encode
+    return _encode
+
+
+def encode_unified_action_prefix(
+    raw_state: np.ndarray,
+    raw_action_prefix: np.ndarray,
+    data_spec: "FinchDataSpec",
+) -> np.ndarray:
+    """Encode an absolute native action prefix into normalized unified space."""
+    return build_unified_action_prefix_encoder(data_spec)(raw_state, raw_action_prefix)
 
 
 # Legacy names. ``normalize_state`` / ``build_state_normalizer`` only covered
@@ -1845,6 +1918,7 @@ def _validate_homogeneous_data_spec(resolved: list[Any]) -> None:
             or other.state_dim != exemplar.state_dim
             or other.action_horizon != exemplar.action_horizon
             or other.action_semantics != exemplar.action_semantics
+            or getattr(other.robot_config, "deployment_contract", None) != getattr(exemplar.robot_config, "deployment_contract", None)
             or other.action_offset_frames != exemplar.action_offset_frames
             or tuple(other.cam_keys) != tuple(exemplar.cam_keys)
             or _resolve_target_size(other) != _resolve_target_size(exemplar)

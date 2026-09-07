@@ -252,7 +252,7 @@ class QzcliPayloadValidationTest(unittest.TestCase):
 
 
 class H200SmokeValidationTest(unittest.TestCase):
-    def _run(self, directory: Path, *, gpu_name: str = "H200") -> subprocess.CompletedProcess[str]:
+    def _run(self, directory: Path, *, gpu_name: str = "H200", extra_log: str = "") -> subprocess.CompletedProcess[str]:
         status = directory / "status.json"
         worker = directory / "worker.log"
         training = directory / "training.log"
@@ -289,6 +289,7 @@ class H200SmokeValidationTest(unittest.TestCase):
             )
             + "\n{'loss': '0.1', 'grad_norm': '1.2', 'global_step': 20}\n"
             "{'train_runtime': '20', 'global_step': 20}\n"
+            + extra_log
         )
         return subprocess.run(
             [
@@ -331,6 +332,18 @@ class H200SmokeValidationTest(unittest.TestCase):
             result = self._run(Path(directory), gpu_name="A100")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not prove H200", result.stderr)
+
+    def test_accepts_nccl_timeout_configuration_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._run(Path(directory), extra_log="NCCL INFO NCCL_IB_TIMEOUT set by environment to 22.\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_still_rejects_actual_nccl_timeout_or_error(self):
+        for line in ("NCCL WARN connection timeout", "NCCL operation timed out", "NCCL WARN unhandled system error"):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as directory:
+                result = self._run(Path(directory), extra_log=line + "\n")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("failure signature found", result.stderr)
 
 
 if __name__ == "__main__":

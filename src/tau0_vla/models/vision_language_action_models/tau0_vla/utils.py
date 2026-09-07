@@ -33,20 +33,23 @@ def create_sinusoidal_pos_embedding(
     max_period: float,
     device="cpu",
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Compute sine-cosine embeddings for batch- or token-level timesteps.
+
+    ``time`` may be ``[B]`` (one flow timestep shared by all action tokens) or
+    ``[B, H]`` (one timestep per action token, as used by training-time RTC).
+    """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor must have shape `(batch_size,)` or `(batch_size, horizon)`.")
 
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=torch.float32, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = scaling_factor * time[..., None]
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
     return pos_emb
 
 

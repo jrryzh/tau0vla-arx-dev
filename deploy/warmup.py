@@ -108,12 +108,38 @@ def _run_dummy_input_warmup(policy, *, warmup_steps: int = 3, seed: int = 42) ->
             int(np.asarray(payload["state"]).size),
         )
         total_t0 = time.perf_counter()
-        for idx in range(warmup_steps):
+        rtc_enabled = bool(getattr(policy, "rtc_enabled", False))
+        rtc_max_delay = int(getattr(policy, "rtc_max_delay", 0) or 0)
+        raw_action_dim = int(np.asarray(payload["state"]).size)
+        registry_key = getattr(policy.data_spec, "unified_registry_key", None)
+        if registry_key is not None:
+            from tau0_vla.data.robots.unified import get_registry_entry
+
+            raw_action_dim = int(get_registry_entry(registry_key).get("action_dim") or raw_action_dim)
+        delays = [0]
+        if rtc_enabled and rtc_max_delay > 0 and registry_key is not None:
+            delays.append(min(rtc_max_delay, max(1, rtc_max_delay // 2)))
+        calls = max(warmup_steps, len(delays)) if len(delays) > 1 else warmup_steps
+        for idx in range(calls):
+            delay = delays[idx % len(delays)]
+            step_payload = payload
+            if rtc_enabled:
+                step_payload = dict(payload)
+                step_payload["meta"] = {
+                    "rtc_delay": delay,
+                    "action_prefix": np.zeros((delay, raw_action_dim), dtype=np.float32),
+                }
             cuda_sync()
             step_t0 = time.perf_counter()
-            policy.infer(payload)
+            policy.infer(step_payload)
             cuda_sync()
-            logger.info("[warmup] step %d/%d: %.1f ms", idx + 1, warmup_steps, (time.perf_counter() - step_t0) * 1000)
+            logger.info(
+                "[warmup] step %d/%d (rtc_delay=%d): %.1f ms",
+                idx + 1,
+                calls,
+                delay,
+                (time.perf_counter() - step_t0) * 1000,
+            )
         logger.info("[warmup] done: total=%.1f ms", (time.perf_counter() - total_t0) * 1000)
     except Exception:
         logger.exception("[warmup] failed; continuing without warmed inference path")
