@@ -18,7 +18,7 @@ LOG_DIR = Path("/home/xiangchengliu/logs/tau0vla-arx")
 PRODUCTION_SESSION = "tau0vla-arx-server"
 CANDIDATE_SESSION = "tau0vla-arx-candidate"
 PRODUCTION_URL = "http://192.168.50.2:8000"
-CANDIDATE_URL = "http://127.0.0.1:8001"
+CANDIDATE_URL = "http://192.168.50.2:8001"
 OPENER = build_opener(ProxyHandler({}))
 
 
@@ -112,8 +112,8 @@ def _stop(session: str) -> None:
 
 def _start(config: dict, *, candidate: bool) -> None:
     session = CANDIDATE_SESSION if candidate else PRODUCTION_SESSION
-    bind_host = "127.0.0.1" if candidate else "192.168.50.2"
-    client_ip = "127.0.0.1" if candidate else "192.168.50.1"
+    bind_host = "192.168.50.2"
+    client_ip = "192.168.50.1"
     port = "8001" if candidate else "8000"
     suffix = "candidate" if candidate else "active"
     log_file = LOG_DIR / f"server_{config['model_id']}_{suffix}.log"
