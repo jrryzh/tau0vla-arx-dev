@@ -127,6 +127,8 @@ def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
             health = await client.get('/health')
             assert health.status_code == 200
             assert health.json()["protocol_version"] == PROTOCOL
+            assert health.json()["recording_mode"] == "background-serialized"
+            assert health.json()["recording_error"] is None
             assert (await client.get('/arx/v3/policy-contract')).status_code == 200
             assert (await client.post('/act')).status_code == 404
             assert (await client.post('/arx/v1/sessions')).status_code == 404
@@ -166,6 +168,8 @@ def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
             assert response.json()["gripper_semantics"] == contract(mode)["gripper_action"]
             assert response.json()["control_mode"] == mode.split('-')[0]
             assert response.json()["wire_action_is_robot_command"] is False
+            assert response.json()["recording_mode"] == "background-serialized"
+            assert response.json()["preprocess_ms"] >= 0
             assert np.asarray(response.json()["calibrated_action_chunk"]).shape == (30, 14)
             duplicate = await client.post(
                 f'/arx/v3/sessions/{session_id}/action-chunks',

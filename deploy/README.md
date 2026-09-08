@@ -234,7 +234,7 @@ session固定任务、模型、实验类型、robot ID、calibration ID和左右
 
 响应字段 `calibrated_action_chunk` 为 `[30,14]`，明确携带 `wire_action_is_robot_command=false`。手臂列是绝对关节目标；夹爪列仍是校准feedback位置或`[0,1]` VR闭合意图，必须由 `arx-calibrated-client-v1` 使用本次command-feedback标定转换后才能发布。EEF checkpoint继续可训练/离线评估，但本轮HTTP真机接口拒绝EEF route。
 
-每次推理在配置的record目录保存NPZ，包含原始反馈、baseline、校准state、模型action、三相机和session/request身份。支持无需机器人在线的回放：
+每次推理在配置的record目录保存NPZ，包含原始反馈、baseline、校准state、模型action、三相机和session/request身份。NPZ压缩在HTTP响应发出后进入串行后台写盘，避免约60ms常态压缩成本和偶发磁盘长尾阻塞动作响应；后台写盘一旦失败，health转为not-ready且后续请求返回503，不会静默丢失。支持无需机器人在线的回放：
 
 ```bash
 PYTHONPATH=src:. .venv/bin/python scripts/replay_blue_t_request.py \

@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 import numpy as np
 from pydantic import BaseModel
@@ -176,7 +176,46 @@ def build_calibrated_app(
     app = FastAPI(title="ARX calibrated v3")
     state_lock = threading.Lock()
     inference_lock = threading.Lock()
+    record_lock = threading.Lock()
+    record_state_lock = threading.Lock()
+    record_error: str | None = None
     active: _Session | None = None
+
+    def write_record(
+        *,
+        target: Path,
+        request_json: str,
+        response_json: str,
+        joint: np.ndarray,
+        eef: np.ndarray,
+        open_baselines: np.ndarray,
+        calibrated_state: np.ndarray,
+        actions: np.ndarray,
+        received: str,
+        images: dict[str, np.ndarray],
+    ) -> None:
+        nonlocal record_error
+        temporary = target.with_suffix(".tmp")
+        try:
+            with record_lock:
+                with temporary.open("wb") as stream:
+                    np.savez_compressed(
+                        stream,
+                        request_json=request_json,
+                        response_json=response_json,
+                        raw_joint_feedback=joint,
+                        raw_eef_feedback=eef,
+                        open_baselines=open_baselines,
+                        calibrated_native_state=calibrated_state,
+                        calibrated_action_chunk=actions,
+                        request_received_utc=received,
+                        **{f"image_{name}": image for name, image in images.items()},
+                    )
+                temporary.replace(target)
+        except Exception as error:
+            with record_state_lock:
+                record_error = f"{type(error).__name__}: {error}"
+            logger.exception("ARX calibrated background recording failed: %s", target)
 
     if allowed_client_ips:
         allowed = frozenset(allowed_client_ips)
@@ -196,15 +235,19 @@ def build_calibrated_app(
 
     @app.get("/health")
     async def health():
+        with record_state_lock:
+            current_record_error = record_error
         return {
             "status": "ok",
-            "ready": True,
+            "ready": current_record_error is None,
             "route": policy.data_spec.finch_config_name,
             "model_id": model_id,
             "checkpoint_sha256": checkpoint_sha256,
             "protocol_version": PROTOCOL,
             "experiment": saved["experiment"],
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
+            "recording_mode": "background-serialized",
+            "recording_error": current_record_error,
         }
 
     @app.get("/arx/v3/policy-contract")
@@ -263,11 +306,20 @@ def build_calibrated_app(
     @app.post("/arx/v3/sessions/{session_id}/action-chunks")
     async def action_chunk(
         session_id: str,
+        background_tasks: BackgroundTasks,
         metadata: str = Form(...),
         head: UploadFile = File(...),
         left_wrist: UploadFile = File(...),
         right_wrist: UploadFile = File(...),
     ):
+        request_started = time.monotonic_ns()
+        with record_state_lock:
+            current_record_error = record_error
+        if current_record_error is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"request recording is unavailable: {current_record_error}",
+            )
         try:
             request = json.loads(metadata)
         except json.JSONDecodeError as error:
@@ -321,6 +373,7 @@ def build_calibrated_app(
             raise HTTPException(status_code=422, detail=str(error)) from error
 
         received = datetime.now(timezone.utc).isoformat()
+        preprocess_ms = (time.monotonic_ns() - request_started) / 1e6
         started = time.monotonic_ns()
         with inference_lock:
             result = policy.infer(payload)
@@ -355,36 +408,36 @@ def build_calibrated_app(
             "calibrated_action_chunk": actions.tolist(),
             "wire_action_is_robot_command": False,
             "inference_ms": inference_ms,
+            "preprocess_ms": preprocess_ms,
+            "recording_mode": "background-serialized",
         }
         model_record_dir.mkdir(parents=True, exist_ok=True)
         target = model_record_dir / f"request-{request_id}-session-{session_id}.npz"
-        temporary = target.with_suffix(".tmp")
-        with temporary.open("wb") as stream:
-            np.savez_compressed(
-                stream,
-                request_json=json.dumps(
-                    {
-                        **request,
-                        "open_baselines": session.open_baselines,
-                        "task_instruction": session.task_instruction,
-                        "experiment": session.experiment,
-                        "calibration_id": session.calibration_id,
-                    },
-                    separators=(",", ":"),
-                ),
-                response_json=json.dumps(response, separators=(",", ":")),
-                raw_joint_feedback=joint,
-                raw_eef_feedback=eef,
-                open_baselines=np.asarray(
-                    [session.open_baselines["left"], session.open_baselines["right"]],
-                    dtype=np.float32,
-                ),
-                calibrated_native_state=np.asarray(payload["state"], dtype=np.float32),
-                calibrated_action_chunk=actions,
-                request_received_utc=received,
-                **{f"image_{name}": image for name, image in images.items()},
-            )
-        temporary.replace(target)
+        background_tasks.add_task(
+            write_record,
+            target=target,
+            request_json=json.dumps(
+                {
+                    **request,
+                    "open_baselines": session.open_baselines,
+                    "task_instruction": session.task_instruction,
+                    "experiment": session.experiment,
+                    "calibration_id": session.calibration_id,
+                },
+                separators=(",", ":"),
+            ),
+            response_json=json.dumps(response, separators=(",", ":")),
+            joint=joint,
+            eef=eef,
+            open_baselines=np.asarray(
+                [session.open_baselines["left"], session.open_baselines["right"]],
+                dtype=np.float32,
+            ),
+            calibrated_state=np.asarray(payload["state"], dtype=np.float32),
+            actions=actions,
+            received=received,
+            images=images,
+        )
         logger.info(
             "ARX calibrated action chunk: session=%s request=%d sample=%d inference_ms=%.1f shape=%s",
             session_id,
