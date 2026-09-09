@@ -8,6 +8,8 @@ client may convert them into X5 command coordinates.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
+import asyncio
 from datetime import datetime, timezone
 import json
 import logging
@@ -17,12 +19,13 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 import numpy as np
 from pydantic import BaseModel
 
 from deploy.arx_lift2s_http import _read_jpeg
+from deploy.record_writer import RecordWriter
 from tau0_vla.adapters.arx_lift2s.calibrated import (
     PROTOCOL as V3_PROTOCOL,
     VERSION as V3_VERSION,
@@ -198,6 +201,7 @@ def build_calibrated_app(
     checkpoint_sha256: str | None = None,
     record_dir: str | Path | None = None,
     allowed_client_ips: tuple[str, ...] = (),
+    record_queue_capacity: int = 16,
 ) -> FastAPI:
     saved = validate_model_contract(policy.data_spec)
     if bool(getattr(policy, "rtc_enabled", False)):
@@ -209,12 +213,17 @@ def build_calibrated_app(
     native_perm = build_native_action_perm(action_slices(policy.data_spec))
 
     api_prefix = "/arx/v3" if saved["protocol_version"] == V3_PROTOCOL else "/arx/v4"
-    app = FastAPI(title=f"ARX {saved['protocol_version']}")
+    recorder = RecordWriter(capacity=record_queue_capacity)
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            await asyncio.to_thread(recorder.close, timeout=30.0)
+    app = FastAPI(title=f"ARX {saved['protocol_version']}", lifespan=lifespan)
+    app.state.record_writer = recorder
     state_lock = threading.Lock()
     inference_lock = threading.Lock()
-    record_lock = threading.Lock()
-    record_state_lock = threading.Lock()
-    record_error: str | None = None
     active: _Session | None = None
 
     def write_record(
@@ -230,12 +239,10 @@ def build_calibrated_app(
         received: str,
         images: dict[str, np.ndarray],
     ) -> None:
-        nonlocal record_error
         temporary = target.with_suffix(".tmp")
         try:
-            with record_lock:
-                with temporary.open("wb") as stream:
-                    np.savez_compressed(
+            with temporary.open("wb") as stream:
+                np.savez_compressed(
                         stream,
                         request_json=request_json,
                         response_json=response_json,
@@ -246,12 +253,11 @@ def build_calibrated_app(
                         calibrated_action_chunk=actions,
                         request_received_utc=received,
                         **{f"image_{name}": image for name, image in images.items()},
-                    )
-                temporary.replace(target)
-        except Exception as error:
-            with record_state_lock:
-                record_error = f"{type(error).__name__}: {error}"
-            logger.exception("ARX calibrated background recording failed: %s", target)
+                )
+            temporary.replace(target)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
 
     if allowed_client_ips:
         allowed = frozenset(allowed_client_ips)
@@ -271,8 +277,8 @@ def build_calibrated_app(
 
     @app.get("/health")
     async def health():
-        with record_state_lock:
-            current_record_error = record_error
+        recording_status = recorder.status()
+        current_record_error = recording_status["recording_error"]
         return {
             "status": "ok",
             "ready": current_record_error is None,
@@ -283,7 +289,7 @@ def build_calibrated_app(
             "experiment": saved["experiment"],
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
             "recording_mode": "background-serialized",
-            "recording_error": current_record_error,
+            **recording_status,
         }
 
     @app.get(f"{api_prefix}/policy-contract")
@@ -342,15 +348,13 @@ def build_calibrated_app(
     @app.post(f"{api_prefix}/sessions/{{session_id}}/action-chunks")
     async def action_chunk(
         session_id: str,
-        background_tasks: BackgroundTasks,
         metadata: str = Form(...),
         head: UploadFile = File(...),
         left_wrist: UploadFile = File(...),
         right_wrist: UploadFile = File(...),
     ):
         request_started = time.monotonic_ns()
-        with record_state_lock:
-            current_record_error = record_error
+        current_record_error = recorder.status()["recording_error"]
         if current_record_error is not None:
             raise HTTPException(
                 status_code=503,
@@ -464,8 +468,7 @@ def build_calibrated_app(
                 response[key] = saved[key]
         model_record_dir.mkdir(parents=True, exist_ok=True)
         target = model_record_dir / f"request-{request_id}-session-{session_id}.npz"
-        background_tasks.add_task(
-            write_record,
+        record_data = dict(
             target=target,
             request_json=json.dumps(
                 {
@@ -478,17 +481,21 @@ def build_calibrated_app(
                 separators=(",", ":"),
             ),
             response_json=json.dumps(response, separators=(",", ":")),
-            joint=joint,
-            eef=eef,
+            joint=joint.copy(),
+            eef=eef.copy(),
             open_baselines=np.asarray(
                 [session.open_baselines["left"], session.open_baselines["right"]],
                 dtype=np.float32,
             ),
-            calibrated_state=np.asarray(payload["state"], dtype=np.float32),
-            actions=actions,
+            calibrated_state=np.asarray(payload["state"], dtype=np.float32).copy(),
+            actions=actions.copy(),
             received=received,
             images=images,
         )
+        try:
+            recorder.submit(write_record, **record_data)
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=f"request recording is unavailable: {error}") from error
         logger.info(
             "ARX calibrated action chunk: session=%s request=%d sample=%d inference_ms=%.1f shape=%s",
             session_id,

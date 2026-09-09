@@ -127,9 +127,10 @@ def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
         jpeg = BytesIO()
         Image.fromarray(images["head"]).save(jpeg, format="JPEG")
         files = {key: (key+".jpg", jpeg.getvalue(), "image/jpeg") for key in images}
-        transport = httpx.ASGITransport(app=build_calibrated_app(
+        app = build_calibrated_app(
             policy, model_id="calibrated-test", checkpoint_sha256="abc", record_dir=tmp_path
-        ))
+        )
+        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             health = await client.get('/health')
             assert health.status_code == 200
@@ -184,6 +185,7 @@ def test_server_training_encoding_and_rotation_roundtrip(tmp_path, mode):
                 files=files,
             )
             assert duplicate.status_code == 409
+        assert await asyncio.to_thread(app.state.record_writer.wait, 5.0)
         recordings = list(tmp_path.rglob('request-*.npz'))
         assert len(recordings) == 1
         with np.load(recordings[0], allow_pickle=False) as recording:
@@ -325,6 +327,7 @@ def test_feedback_v4_sessioned_http_omits_eef_and_preserves_recording(tmp_path):
                     data={"metadata": json.dumps({**request, "request_id": invalid_id})}, files=files,
                 )
                 assert rejected.status_code == 409
+        assert await asyncio.to_thread(app.state.record_writer.wait, 5.0)
         recordings = list(tmp_path.rglob("request-*.npz"))
         assert len(recordings) == 1
         with np.load(recordings[0], allow_pickle=False) as recording:
@@ -346,7 +349,7 @@ def test_constant_gripper_normalization_is_finite():
 
 
 @pytest.mark.parametrize("feedback_v4", (False, True))
-def test_recording_runs_after_response_and_failure_closes_health(tmp_path, monkeypatch, feedback_v4):
+def test_recording_failure_closes_health(tmp_path, monkeypatch, feedback_v4):
     """A background write failure must be visible before any subsequent inference."""
     import asyncio
     from io import BytesIO
@@ -370,23 +373,14 @@ def test_recording_runs_after_response_and_failure_closes_health(tmp_path, monke
         SimpleNamespace(data_spec=spec, rtc_enabled=False, infer=infer),
         model_id="recording-failure-test", record_dir=tmp_path,
     )
-    response_sent = []
-    write_after_response = []
-    async def observed_app(scope, receive, send):
-        async def observed_send(message):
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                response_sent.append(scope["path"])
-            await send(message)
-        await app(scope, receive, observed_send)
     def failed_write(*args, **kwargs):
-        write_after_response.append(any(path.endswith("/action-chunks") for path in response_sent))
         raise OSError("simulated disk full")
     monkeypatch.setattr(np, "savez_compressed", failed_write)
     image = BytesIO()
     Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(image, format="JPEG")
     files = {name: (name + ".jpg", image.getvalue(), "image/jpeg") for name in ("head", "left_wrist", "right_wrist")}
     async def check():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=observed_app), base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             created = await client.post(prefix + "/sessions", json={
                 "protocol_version": protocol, "calibration_version": version,
                 "client_adapter_version": "arx-calibrated-client-v1", "experiment": "joint-feedback",
@@ -400,7 +394,7 @@ def test_recording_runs_after_response_and_failure_closes_health(tmp_path, monke
                 request["raw_eef_feedback"] = [0.] * 14
             response = await client.post(endpoint, data={"metadata": json.dumps(request)}, files=files)
             assert response.status_code == 200
-            assert write_after_response == [True]
+            assert await asyncio.to_thread(app.state.record_writer.wait, 5.0)
             health = (await client.get("/health")).json()
             assert health["ready"] is False
             assert "simulated disk full" in health["recording_error"]
@@ -408,3 +402,84 @@ def test_recording_runs_after_response_and_failure_closes_health(tmp_path, monke
             assert rejected.status_code == 503
             assert len(inference_calls) == 1
     asyncio.run(check())
+
+
+def test_tcp_keepalive_recording_does_not_block_next_request_and_backlog_fails_closed(tmp_path, monkeypatch):
+    """Reproduce the deployed middleware + reused TCP connection, not ASGITransport."""
+    from io import BytesIO
+    import socket
+    import threading
+    import time
+
+    import requests
+    import uvicorn
+    from PIL import Image
+
+    spec = spec_for(tmp_path, "joint-feedback")
+    spec.robot_cls = ArxFeedbackJoint
+    spec.robot_name = spec.unified_registry_key = FEEDBACK_BODY
+    spec.deployment_contract = feedback_contract()
+    spec.action_semantics = feedback_contract()["action_semantics"]
+    app = build_calibrated_app(
+        SimpleNamespace(data_spec=spec, rtc_enabled=False,
+                        infer=lambda _: {"actions": np.zeros((30, 14), dtype=np.float32)}),
+        model_id="tcp-test", record_dir=tmp_path, allowed_client_ips=("127.0.0.1",),
+        record_queue_capacity=1,
+    )
+    entered, release = threading.Event(), threading.Event()
+    original_save = np.savez_compressed
+    def blocked_save(*args, **kwargs):
+        entered.set()
+        if not release.wait(10):
+            raise TimeoutError("test failed to release writer")
+        return original_save(*args, **kwargs)
+    monkeypatch.setattr(np, "savez_compressed", blocked_save)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    address = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]})
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not server.started:
+            if time.monotonic() > deadline:
+                raise TimeoutError("test server did not start")
+            threading.Event().wait(.01)
+        image = BytesIO()
+        Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(image, format="JPEG")
+        files = {name: (name + ".jpg", image.getvalue(), "image/jpeg") for name in ("head", "left_wrist", "right_wrist")}
+        with requests.Session() as client:
+            client.trust_env = False
+            created = client.post(address + "/arx/v4/sessions", json={
+                "protocol_version": FEEDBACK_PROTOCOL, "calibration_version": FEEDBACK_VERSION,
+                "client_adapter_version": "arx-calibrated-client-v1", "experiment": "joint-feedback",
+                "task_instruction": "pick", "client_name": "test", "robot_id": "synthetic",
+                "calibration_id": "synthetic", "open_baselines": {"left": -3.3, "right": -3.3},
+            }, timeout=1)
+            created.raise_for_status()
+            endpoint = address + f"/arx/v4/sessions/{created.json()['session_id']}/action-chunks"
+            def action(request_id):
+                metadata = {"protocol_version": FEEDBACK_PROTOCOL, "request_id": request_id,
+                            "sample_monotonic_ns": request_id, "raw_joint_feedback": [0.] * 14}
+                return client.post(endpoint, data={"metadata": json.dumps(metadata)}, files=files, timeout=1)
+            assert action(1).status_code == 200
+            assert entered.wait(1)
+            # The first write is still held. BackgroundTasks would block this reused connection.
+            assert action(2).status_code == 200
+            assert not release.is_set()
+            assert action(3).status_code == 503  # queue full: no unrecorded successful response
+            health = client.get(address + "/health", timeout=1).json()
+            assert health["ready"] is False
+            assert health["recording_queue_depth"] == 1
+            assert "backlog" in health["recording_error"]
+            assert action(4).status_code == 503
+        release.set()
+        assert app.state.record_writer.wait(5)
+        assert len(list(tmp_path.rglob("request-*.npz"))) == 2
+    finally:
+        release.set()
+        server.should_exit = True
+        thread.join(5)
+        sock.close()
+    assert not thread.is_alive()
