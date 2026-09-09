@@ -9,6 +9,13 @@ from tau0_vla.adapters.arx_lift2s.calibrated import (
     VERSION, PROTOCOL, POSE_INDICES, MODES, ArxCalibratedJoint, ArxCalibratedEEF,
     calibrate_joint, contract, estimate_open, labels,
 )
+from tau0_vla.adapters.arx_lift2s.feedback import (
+    BODY as FEEDBACK_BODY,
+    PROTOCOL as FEEDBACK_PROTOCOL,
+    VERSION as FEEDBACK_VERSION,
+    ArxFeedbackJoint,
+    contract as feedback_contract,
+)
 from tau0_vla.data.data_spec import build_unified_state_encoder, encode_unified_action_prefix, restore_action, action_slices
 from deploy.arx_calibrated_http import adapt_request, build_calibrated_app
 
@@ -222,6 +229,94 @@ def test_new_calibrated_session_invalidates_previous_session(tmp_path):
                 '/arx/v3/sessions', json={**payload, "calibration_id": "two"}
             )).json()["session_id"]
             assert first != second
+
+    asyncio.run(check())
+
+
+def test_feedback_v4_sessioned_http_omits_eef_and_preserves_recording(tmp_path):
+    import asyncio
+    from io import BytesIO
+
+    import httpx
+    from PIL import Image
+
+    spec = spec_for(tmp_path, "joint-feedback")
+    spec.robot_cls = ArxFeedbackJoint
+    spec.robot_name = FEEDBACK_BODY
+    spec.unified_registry_key = FEEDBACK_BODY
+    spec.finch_config_name = "arx-lift2s-0908-all-joint-feedback-ft"
+    spec.deployment_contract = feedback_contract()
+    spec.action_semantics = feedback_contract()["action_semantics"]
+    policy = SimpleNamespace(
+        data_spec=spec,
+        rtc_enabled=False,
+        infer=lambda payload: {"actions": np.zeros((30, 14), dtype=np.float32)},
+    )
+    app = build_calibrated_app(
+        policy,
+        model_id="feedback-v4-test",
+        checkpoint_sha256="v4sha",
+        record_dir=tmp_path,
+    )
+    image = BytesIO()
+    Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(image, format="JPEG")
+    files = {
+        name: (f"{name}.jpg", image.getvalue(), "image/jpeg")
+        for name in ("head", "left_wrist", "right_wrist")
+    }
+
+    async def check():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            health = await client.get("/health")
+            assert health.json()["protocol_version"] == FEEDBACK_PROTOCOL
+            assert health.json()["recording_mode"] == "background-serialized"
+            contract_response = await client.get("/arx/v4/policy-contract")
+            assert contract_response.status_code == 200
+            assert contract_response.json()["calibration_version"] == FEEDBACK_VERSION
+            assert "raw_eef_feedback" not in contract_response.json()["request_fields"]
+            assert (await client.get("/arx/v3/policy-contract")).status_code == 404
+            opened = await client.post(
+                "/arx/v4/sessions",
+                json={
+                    "protocol_version": FEEDBACK_PROTOCOL,
+                    "calibration_version": FEEDBACK_VERSION,
+                    "client_adapter_version": "arx-calibrated-client-v1",
+                    "experiment": "joint-feedback",
+                    "task_instruction": "pick",
+                    "client_name": "test",
+                    "robot_id": "ark-2",
+                    "calibration_id": "calibration",
+                    "open_baselines": {"left": -3.3, "right": -3.3},
+                },
+            )
+            assert opened.status_code == 200, opened.text
+            session_id = opened.json()["session_id"]
+            request = {
+                "protocol_version": FEEDBACK_PROTOCOL,
+                "request_id": 1,
+                "sample_monotonic_ns": 1,
+                "raw_joint_feedback": [0.0] * 14,
+            }
+            response = await client.post(
+                f"/arx/v4/sessions/{session_id}/action-chunks",
+                data={"metadata": json.dumps(request)},
+                files=files,
+            )
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert payload["protocol_version"] == FEEDBACK_PROTOCOL
+            assert payload["calibration_version"] == FEEDBACK_VERSION
+            assert payload["component_source_offsets"] == {
+                "state": 0,
+                "arm_action": 1,
+                "gripper_action": 1,
+            }
+        recordings = list(tmp_path.rglob("request-*.npz"))
+        assert len(recordings) == 1
+        with np.load(recordings[0], allow_pickle=False) as recording:
+            assert recording["raw_eef_feedback"].size == 0
+            assert recording["calibrated_action_chunk"].shape == (30, 14)
 
     asyncio.run(check())
 

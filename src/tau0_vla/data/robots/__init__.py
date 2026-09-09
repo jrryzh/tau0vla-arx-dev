@@ -25,7 +25,12 @@ from tau0_vla.data.robots.unified import UNIFIED_DIM, UNIFIED_LAYOUT, UnifiedAss
 # initialized module" when a caller imports the adapter first — which the
 # deploy path does. Deferring makes both orders work.
 
-_ADAPTER_MODULES = ("tau0_vla.adapters.g1", "tau0_vla.adapters.arx_lift2s", "tau0_vla.adapters.arx_lift2s.calibrated")
+_ADAPTER_MODULES = (
+    "tau0_vla.adapters.g1",
+    "tau0_vla.adapters.arx_lift2s",
+    "tau0_vla.adapters.arx_lift2s.calibrated",
+    "tau0_vla.adapters.arx_lift2s.feedback",
+)
 
 # Robot name (as recorded in a Data Spec) -> ``(module, attr)`` of its
 # RobotConfig class. These keys are part of the serialized contract.
@@ -35,6 +40,10 @@ _ADAPTER_MODULES = ("tau0_vla.adapters.g1", "tau0_vla.adapters.arx_lift2s", "tau
 # the end of training, so a missing name aborts the run after the pipeline has
 # already built — long after the point where a typo would be cheap to notice.
 _ROBOT_CLASS_PATHS = {
+    "arx_feedback_joint_v1": (
+        "tau0_vla.adapters.arx_lift2s.feedback",
+        "ArxFeedbackJoint",
+    ),
     "arx_calibrated_joint_v1": ("tau0_vla.adapters.arx_lift2s.calibrated", "ArxCalibratedJoint"),
     "arx_calibrated_eef_v1": ("tau0_vla.adapters.arx_lift2s.calibrated", "ArxCalibratedEEF"),
     "g1_agibot": ("tau0_vla.adapters.g1", "G1Agibot"),

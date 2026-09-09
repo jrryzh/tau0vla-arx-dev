@@ -1,4 +1,4 @@
-"""Sessioned ARX calibrated-v3 HTTP API.
+"""Sessioned ARX calibrated-v3 and feedback-v4 HTTP API.
 
 The wire action is deliberately *not* a robot command. Arm columns are
 absolute joint targets, while gripper columns retain the checkpoint's
@@ -23,7 +23,18 @@ import numpy as np
 from pydantic import BaseModel
 
 from deploy.arx_lift2s_http import _read_jpeg
-from tau0_vla.adapters.arx_lift2s.calibrated import PROTOCOL, VERSION, calibrate_joint, contract
+from tau0_vla.adapters.arx_lift2s.calibrated import (
+    PROTOCOL as V3_PROTOCOL,
+    VERSION as V3_VERSION,
+    calibrate_joint,
+    contract as calibrated_contract,
+)
+from tau0_vla.adapters.arx_lift2s.feedback import (
+    BODY as FEEDBACK_BODY,
+    PROTOCOL as V4_PROTOCOL,
+    VERSION as V4_VERSION,
+    contract as feedback_contract,
+)
 from tau0_vla.adapters.arx_lift2s.deploy_io import build_native_action_perm
 from tau0_vla.adapters.arx_lift2s.layout import ARX_LIFT2S_JOINT_NAMES
 from tau0_vla.data import action_slices
@@ -64,17 +75,25 @@ class _Session:
 
 def validate_model_contract(spec) -> dict[str, Any]:
     saved = getattr(spec, "deployment_contract", None)
-    if not isinstance(saved, dict) or saved != contract(saved.get("experiment")):
-        raise ValueError("checkpoint is missing the calibrated deployment contract")
+    if isinstance(saved, dict) and saved == feedback_contract():
+        if (
+            spec.unified_registry_key != FEEDBACK_BODY
+            or bool(spec.unified_has_eef)
+            or spec.action_semantics != saved["action_semantics"]
+        ):
+            raise ValueError("feedback checkpoint encoding and deployment contract disagree")
+    elif not isinstance(saved, dict) or saved != calibrated_contract(saved.get("experiment")):
+        raise ValueError("checkpoint is missing a supported ARX deployment contract")
     mode = saved["experiment"]
     if mode not in SUPPORTED_EXPERIMENTS:
         raise ValueError(f"calibrated ARX HTTP supports {SUPPORTED_EXPERIMENTS}, got {mode!r}")
-    if (
-        spec.unified_registry_key != "arx_calibrated_joint_v1"
-        or bool(spec.unified_has_eef)
-        or spec.action_semantics != saved["action_semantics"]
-    ):
-        raise ValueError("checkpoint encoding and deployment contract disagree")
+    if saved["protocol_version"] == V3_PROTOCOL:
+        if (
+            spec.unified_registry_key != "arx_calibrated_joint_v1"
+            or bool(spec.unified_has_eef)
+            or spec.action_semantics != saved["action_semantics"]
+        ):
+            raise ValueError("calibrated checkpoint encoding and deployment contract disagree")
     if tuple(getattr(spec, "cam_keys", ())) != CAMERA_NAMES:
         raise ValueError(f"calibrated ARX checkpoint requires cameras {CAMERA_NAMES}")
     if int(getattr(spec, "action_chunk_size", 0)) != ACTION_HORIZON:
@@ -104,14 +123,19 @@ def _validate_open_baselines(value: Any) -> dict[str, float]:
 def adapt_request(raw: dict[str, Any], images: dict[str, np.ndarray], spec) -> dict[str, Any]:
     """Build the policy payload from raw robot feedback and fixed session data."""
     saved = validate_model_contract(spec)
-    if raw.get("protocol_version") != PROTOCOL or raw.get("calibration_version") != VERSION:
-        raise ValueError("explicit v3 protocol and calibration version required")
+    if (
+        raw.get("protocol_version") != saved["protocol_version"]
+        or raw.get("calibration_version") != saved["contract_version"]
+    ):
+        raise ValueError("explicit matching protocol and calibration version required")
     if raw.get("experiment") != saved["experiment"]:
         raise ValueError("request experiment does not match checkpoint")
     if any(key in raw for key in ("state", "observation_state", "calibrated_state")):
         raise ValueError("send raw feedback and open baselines; pre-calibrated state is not accepted")
     joint = _finite_vector(raw.get("raw_joint_feedback"), "raw_joint_feedback")
-    eef = _finite_vector(raw.get("raw_eef_feedback"), "raw_eef_feedback")
+    eef = None
+    if saved["protocol_version"] == V3_PROTOCOL:
+        eef = _finite_vector(raw.get("raw_eef_feedback"), "raw_eef_feedback")
     opened = _validate_open_baselines(raw.get("open_baselines"))
     instruction = raw.get("task_instruction")
     if not isinstance(instruction, str) or not instruction.strip():
@@ -129,7 +153,7 @@ def adapt_request(raw: dict[str, Any], images: dict[str, np.ndarray], spec) -> d
         "meta": {
             "request_id": raw["request_id"],
             "sample_monotonic_ns": raw["sample_monotonic_ns"],
-            "raw_eef_feedback": eef,
+            **({"raw_eef_feedback": eef} if eef is not None else {}),
         },
     }
 
@@ -137,8 +161,8 @@ def adapt_request(raw: dict[str, Any], images: dict[str, np.ndarray], spec) -> d
 def _contract_payload(saved, *, model_id: str, checkpoint_sha256: str | None, record_dir: Path):
     return {
         **saved,
-        "protocol_version": PROTOCOL,
-        "calibration_version": VERSION,
+        "protocol_version": saved["protocol_version"],
+        "calibration_version": saved["contract_version"],
         "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
         "robot": "ARX LIFT2s",
         "fps": FPS,
@@ -153,6 +177,17 @@ def _contract_payload(saved, *, model_id: str, checkpoint_sha256: str | None, re
         "model_id": model_id,
         "checkpoint_sha256": checkpoint_sha256,
         "record_dir": str(record_dir),
+        "request_fields": [
+            "protocol_version",
+            "raw_joint_feedback",
+            "open_baselines",
+            "calibration_version",
+            "experiment",
+            "request_id",
+            "sample_monotonic_ns",
+            "task_instruction",
+            *(["raw_eef_feedback"] if saved["protocol_version"] == V3_PROTOCOL else []),
+        ],
     }
 
 
@@ -166,14 +201,15 @@ def build_calibrated_app(
 ) -> FastAPI:
     saved = validate_model_contract(policy.data_spec)
     if bool(getattr(policy, "rtc_enabled", False)):
-        raise ValueError("calibrated v3 experiments require RTC disabled")
+        raise ValueError("ARX calibrated/feedback experiments require RTC disabled")
     model_id = model_id or policy.data_spec.finch_config_name
     record_root = Path(record_dir or "outputs/arx_calibrated_inference")
     model_record_dir = record_root / str(model_id).replace("/", "_")
     model_record_dir.mkdir(parents=True, exist_ok=True)
     native_perm = build_native_action_perm(action_slices(policy.data_spec))
 
-    app = FastAPI(title="ARX calibrated v3")
+    api_prefix = "/arx/v3" if saved["protocol_version"] == V3_PROTOCOL else "/arx/v4"
+    app = FastAPI(title=f"ARX {saved['protocol_version']}")
     state_lock = threading.Lock()
     inference_lock = threading.Lock()
     record_lock = threading.Lock()
@@ -243,23 +279,23 @@ def build_calibrated_app(
             "route": policy.data_spec.finch_config_name,
             "model_id": model_id,
             "checkpoint_sha256": checkpoint_sha256,
-            "protocol_version": PROTOCOL,
+            "protocol_version": saved["protocol_version"],
             "experiment": saved["experiment"],
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
             "recording_mode": "background-serialized",
             "recording_error": current_record_error,
         }
 
-    @app.get("/arx/v3/policy-contract")
+    @app.get(f"{api_prefix}/policy-contract")
     async def policy_contract():
         return contract_payload
 
-    @app.post("/arx/v3/sessions")
+    @app.post(f"{api_prefix}/sessions")
     async def create_session(request: SessionRequest):
         nonlocal active
-        if request.protocol_version != PROTOCOL:
+        if request.protocol_version != saved["protocol_version"]:
             raise HTTPException(status_code=409, detail="protocol version mismatch")
-        if request.calibration_version != VERSION:
+        if request.calibration_version != saved["contract_version"]:
             raise HTTPException(status_code=409, detail="calibration version mismatch")
         if request.client_adapter_version != CLIENT_ADAPTER_VERSION:
             raise HTTPException(status_code=409, detail="client adapter version mismatch")
@@ -296,14 +332,14 @@ def build_calibrated_app(
             session.calibration_id,
         )
         return {
-            "protocol_version": PROTOCOL,
+            "protocol_version": saved["protocol_version"],
             "session_id": session.session_id,
             "model_id": model_id,
             "experiment": session.experiment,
             "calibration_id": session.calibration_id,
         }
 
-    @app.post("/arx/v3/sessions/{session_id}/action-chunks")
+    @app.post(f"{api_prefix}/sessions/{{session_id}}/action-chunks")
     async def action_chunk(
         session_id: str,
         background_tasks: BackgroundTasks,
@@ -326,13 +362,17 @@ def build_calibrated_app(
             raise HTTPException(status_code=422, detail="metadata is not valid JSON") from error
         if not isinstance(request, dict):
             raise HTTPException(status_code=422, detail="metadata must be a JSON object")
-        if request.get("protocol_version") != PROTOCOL:
+        if request.get("protocol_version") != saved["protocol_version"]:
             raise HTTPException(status_code=409, detail="protocol version mismatch")
         try:
             request_id = int(request["request_id"])
             sample_monotonic_ns = int(request["sample_monotonic_ns"])
             joint = _finite_vector(request.get("raw_joint_feedback"), "raw_joint_feedback")
-            eef = _finite_vector(request.get("raw_eef_feedback"), "raw_eef_feedback")
+            eef = (
+                _finite_vector(request.get("raw_eef_feedback"), "raw_eef_feedback")
+                if saved["protocol_version"] == V3_PROTOCOL
+                else np.asarray([], dtype=np.float32)
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         if request_id < 1 or sample_monotonic_ns < 1:
@@ -357,16 +397,17 @@ def build_calibrated_app(
             "right_wrist": await _read_jpeg(right_wrist, "right_wrist"),
         }
         raw = {
-            "protocol_version": PROTOCOL,
-            "calibration_version": VERSION,
+            "protocol_version": saved["protocol_version"],
+            "calibration_version": saved["contract_version"],
             "experiment": session.experiment,
             "request_id": request_id,
             "sample_monotonic_ns": sample_monotonic_ns,
             "task_instruction": session.task_instruction,
             "raw_joint_feedback": joint,
-            "raw_eef_feedback": eef,
             "open_baselines": session.open_baselines,
         }
+        if saved["protocol_version"] == V3_PROTOCOL:
+            raw["raw_eef_feedback"] = eef
         try:
             payload = adapt_request(raw, images, policy.data_spec)
         except (KeyError, TypeError, ValueError) as error:
@@ -390,8 +431,8 @@ def build_calibrated_app(
             session.last_request_id = request_id
 
         response = {
-            "protocol_version": PROTOCOL,
-            "calibration_version": VERSION,
+            "protocol_version": saved["protocol_version"],
+            "calibration_version": saved["contract_version"],
             "required_client_adapter_version": CLIENT_ADAPTER_VERSION,
             "session_id": session_id,
             "request_id": request_id,
@@ -402,8 +443,7 @@ def build_calibrated_app(
             "control_mode": saved["control_mode"],
             "gripper_semantics": saved["gripper_action"],
             "component_source_offsets": saved["component_source_offsets"],
-            "source_fps": saved["source_fps"],
-            "temporal_stride": saved["temporal_stride"],
+            "offset_unit": saved["offset_unit"],
             "action_dt": 1.0 / FPS,
             "calibrated_action_chunk": actions.tolist(),
             "wire_action_is_robot_command": False,
@@ -411,6 +451,9 @@ def build_calibrated_app(
             "preprocess_ms": preprocess_ms,
             "recording_mode": "background-serialized",
         }
+        for key in ("source_fps", "temporal_stride"):
+            if key in saved:
+                response[key] = saved[key]
         model_record_dir.mkdir(parents=True, exist_ok=True)
         target = model_record_dir / f"request-{request_id}-session-{session_id}.npz"
         background_tasks.add_task(
