@@ -71,6 +71,19 @@ def package(args) -> Path:
         if not (spec_dir / name).is_file():
             raise FileNotFoundError(f"data spec is missing {name}: {spec_dir}")
 
+    spec = json.loads((spec_dir / "spec.json").read_text(encoding="utf-8"))
+    run_spec = json.loads((checkpoint / "run_spec.json").read_text(encoding="utf-8"))
+    deployment_contract = spec.get("deployment_contract")
+    if deployment_contract is not None and deployment_contract.get("experiment") not in (
+        "joint-feedback", "joint-vr",
+    ):
+        raise ValueError("inference bundle supports calibrated joint-feedback/joint-vr only")
+    # These are provenance strings, not local paths to resolve or copy from.
+    original_checkpoint = getattr(args, "source_checkpoint", None) or str(checkpoint)
+    original_run = getattr(args, "source_run", None) or str(run_root)
+    if not str(original_checkpoint).startswith("/") or not str(original_run).startswith("/"):
+        raise ValueError("original source checkpoint and run must be absolute paths")
+
     output.mkdir(parents=True)
     linked_model = bool(getattr(args, "link_model", False))
     for name in INFERENCE_FILES:
@@ -83,21 +96,13 @@ def package(args) -> Path:
             shutil.copy2(source, target)
     shutil.copytree(spec_dir, output / "finch_data_spec" / spec_dir.name)
 
-    spec = json.loads((spec_dir / "spec.json").read_text(encoding="utf-8"))
-    run_spec = json.loads((checkpoint / "run_spec.json").read_text(encoding="utf-8"))
-    deployment_contract = spec.get("deployment_contract")
-    if deployment_contract is not None and deployment_contract.get("experiment") not in (
-        "joint-feedback",
-        "joint-vr",
-    ):
-        raise ValueError("inference bundle supports calibrated joint-feedback/joint-vr only")
     model_sha256 = _sha256(output / "model.safetensors")
     deployment = {
         "schema_version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_checkpoint": str(checkpoint),
-        "source_run": str(run_root),
-        "source_checkpoint_name": checkpoint.name,
+        "source_checkpoint": str(original_checkpoint),
+        "source_run": str(original_run),
+        "source_checkpoint_name": Path(original_checkpoint).name,
         "training_git_commit": run_spec.get("git_hash"),
         "training_git_dirty": bool(run_spec.get("git_dirty")),
         "service_compatibility_commit": _git_head(args.repo_root.resolve()),
@@ -144,6 +149,8 @@ def parse_args():
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--task-instruction", required=True)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--source-checkpoint", help="original absolute checkpoint path when packaging a staged copy")
+    parser.add_argument("--source-run", help="original absolute training run path when packaging a staged copy")
     parser.add_argument(
         "--link-model",
         action="store_true",

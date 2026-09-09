@@ -241,4 +241,57 @@ PYTHONPATH=src:. .venv/bin/python scripts/replay_blue_t_request.py \
   --model <checkpoint> --request <recorded-request.npz> --out outputs/offline_replay
 ```
 
-使用 `scripts/package_arx_inference_bundle.py` 将checkpoint与其run-level `finch_data_spec`打包成自包含推理目录。模型服务器用 `scripts/manage_arx_server.py prepare|candidate|promote|rollback|status` 校验、候选测试、切换和回滚；candidate固定为`127.0.0.1:8001`，production固定为`192.168.50.2:8000`。
+使用 `scripts/package_arx_inference_bundle.py` 将checkpoint与其run-level `finch_data_spec`打包成自包含推理目录。模型服务器用 `scripts/manage_arx_server.py prepare|candidate|promote|rollback|status` 校验、候选测试、切换和回滚；candidate固定为`192.168.50.2:8001`，production固定为`192.168.50.2:8000`。
+
+## 0908 feedback-v4 部署
+
+0908 All 模型使用 `/arx/v4/policy-contract`、`/arx/v4/sessions` 和
+`/arx/v4/sessions/{session_id}/action-chunks`。协议为 `arx-feedback-v4`，
+契约为 `arx-feedback-open-v1`，registry 为 `arx_feedback_joint_v1`。
+请求只上传14D原始关节反馈和三路相机，不要求EEF。输出为30步14D，
+机械臂与夹爪相对当前观测均偏移一个上传的30Hz帧，RTC关闭。
+
+从暂存目录打包时，使用 `--source-checkpoint /inspire/.../checkpoint-30000`
+和 `--source-run /inspire/...` 保存真实训练来源；`--checkpoint`、`--run-root`
+仍指向本地暂存文件。`--link-model` 将同盘已有权重设为只读并硬链接，
+训练提交从未修改的 `run_spec.json` 读取。生成的 `SHA256SUMS` 包含部署清单本身。
+
+在模型服务器新 worktree 中，使用模型环境的 Python：
+
+```bash
+PYTHON=/home/xiangchengliu/anaconda3/envs/tau0-vla/bin/python
+BUNDLE=/home/xiangchengliu/models/tau0vla-arx-0908-all-joint-feedback-64g30k-h200-step30000
+"$PYTHON" scripts/manage_arx_server.py prepare "$BUNDLE"
+"$PYTHON" scripts/manage_arx_server.py candidate "$BUNDLE" --startup-timeout 600
+```
+
+`prepare` 校验所有校验和、代码兼容提交、Data Spec、registry、14D动作排列及RTC配置。
+候选服务就绪后，还必须运行真实HTTP请求；加载过程的内部预热日志不能替代HTTP验证。
+以下探针需要准确的模型ID、权重摘要和任务训练文本：
+
+```bash
+"$PYTHON" scripts/probe_arx_feedback.py \
+  --server-url http://192.168.50.2:8001 \
+  --model-id "$MODEL_ID" --checkpoint-sha256 "$CHECKPOINT_SHA256" \
+  --task-instruction "$TASK_INSTRUCTION" \
+  --warmup 3 --requests 30 --verify-records --report /tmp/arx-v4-candidate.json
+"$PYTHON" scripts/manage_arx_server.py promote "$BUNDLE" --startup-timeout 600
+"$PYTHON" scripts/manage_arx_server.py status
+```
+
+探针仅依赖 requests、numpy、Pillow，可复制到方舟用其Python环境运行；
+在方舟上改为8000并省略 `--verify-records`，该选项仅在模型服务器本机检查NPZ。
+它不导入ROS、不读取硬件、不发运动指令，使用640×480确定性三相机图像、
+固定准备姿态关节值与合成open baseline。报告标注为合成HTTP测试，不能证明真机效果。
+报告保留session/request ID、NPZ路径、RTT分位数和超过500ms的请求数。
+NPZ在HTTP响应后异步完成，`--verify-records` 等待文件原子落盘后核对身份及形状。
+创建新session会使旧session失效，因此只能在机器人rollout停止时运行探针。
+
+`promote` 先检查候选ready、model/hash/route/protocol与完整契约再切换。
+候选失败会停止候选进程；正式启动失败会停止该进程。仅当旧服务在切换前
+确实存活、就绪且其bundle校验通过时，才保存并自动恢复旧服务。
+没有这样的旧服务时清除陈旧previous记录；`rollback` 拒绝未经现场验证的旧记录。
+首次编译较慢时可增加 `--startup-timeout`，默认600秒。
+
+现场方舟启动统一使用 `LIFT_HEIGHT=12.5`。相机、ROS域、夹爪标定与安全归位
+由匹配的feedback-v4客户端处理；服务器与HTTP探针不控制升降或机器人运动。

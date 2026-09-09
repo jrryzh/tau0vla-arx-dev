@@ -365,8 +365,11 @@ def build_calibrated_app(
         if request.get("protocol_version") != saved["protocol_version"]:
             raise HTTPException(status_code=409, detail="protocol version mismatch")
         try:
-            request_id = int(request["request_id"])
-            sample_monotonic_ns = int(request["sample_monotonic_ns"])
+            for key in ("request_id", "sample_monotonic_ns"):
+                if type(request.get(key)) is not int or request[key] < 1:
+                    raise ValueError(f"{key} must be a positive integer")
+            request_id = request["request_id"]
+            sample_monotonic_ns = request["sample_monotonic_ns"]
             joint = _finite_vector(request.get("raw_joint_feedback"), "raw_joint_feedback")
             eef = (
                 _finite_vector(request.get("raw_eef_feedback"), "raw_eef_feedback")
@@ -417,10 +420,15 @@ def build_calibrated_app(
         preprocess_ms = (time.monotonic_ns() - request_started) / 1e6
         started = time.monotonic_ns()
         with inference_lock:
+            # Upload reads above may yield to another request/session. Recheck
+            # before using the model, so concurrent duplicates cannot both run.
+            with state_lock:
+                if active is not session or request_id != session.last_request_id + 1:
+                    raise HTTPException(status_code=409, detail="session or request order changed during upload")
             result = policy.infer(payload)
         inference_ms = (time.monotonic_ns() - started) / 1e6
         actions = np.asarray(result["actions"], dtype=np.float32)
-        if actions.shape[0] != ACTION_HORIZON or actions.ndim != 2:
+        if actions.ndim != 2 or actions.shape[0] != ACTION_HORIZON:
             raise HTTPException(status_code=500, detail=f"policy returned invalid action shape {actions.shape}")
         actions = actions[:, native_perm]
         if actions.shape != (ACTION_HORIZON, ACTION_DIM) or not np.isfinite(actions).all():

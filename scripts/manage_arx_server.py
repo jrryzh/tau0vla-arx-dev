@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# A shared environment can have an editable install pointing at another checkout.
+sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
 START_SCRIPT = ROOT / "scripts/start_arx_lift2s_server.sh"
 STATE_DIR = Path("/home/xiangchengliu/logs/tau0vla-arx/deployment-state")
 LOG_DIR = Path("/home/xiangchengliu/logs/tau0vla-arx")
@@ -37,12 +41,36 @@ def _run(
     )
 
 
-def _health(url: str, timeout: float = 3.0) -> dict | None:
+def _get_json(url: str, timeout: float = 3.0) -> dict | None:
     try:
-        with OPENER.open(f"{url}/health", timeout=timeout) as response:
+        with OPENER.open(url, timeout=timeout) as response:
             return json.loads(response.read())
     except (OSError, URLError, ValueError):
         return None
+
+
+def _health(url: str, timeout: float = 3.0) -> dict | None:
+    return _get_json(f"{url}/health", timeout=timeout)
+
+
+def _verify_live(url: str, expected: dict, health: dict | None = None) -> dict:
+    health = _health(url) if health is None else health
+    if not isinstance(health, dict) or health.get("ready") is not True:
+        raise RuntimeError(f"{url} is not ready: {health}")
+    for key in ("model_id", "checkpoint_sha256", "route", "protocol_version"):
+        if health.get(key) != expected[key]:
+            raise RuntimeError(f"{url} {key}={health.get(key)!r}, expected {expected[key]!r}")
+    prefix = "/arx/v4" if expected["protocol_version"] == "arx-feedback-v4" else "/arx/v3"
+    contract = _get_json(f"{url}{prefix}/policy-contract")
+    if not isinstance(contract, dict):
+        raise RuntimeError(f"{url} policy contract is unavailable")
+    for key, value in expected["deployment_contract"].items():
+        if contract.get(key) != value:
+            raise RuntimeError(f"{url} contract mismatch for {key}")
+    for key in ("model_id", "checkpoint_sha256"):
+        if contract.get(key) != expected[key]:
+            raise RuntimeError(f"{url} contract identity mismatch for {key}")
+    return health
 
 
 def _wait_health(url: str, expected: dict, timeout: float = 180.0) -> dict:
@@ -56,7 +84,7 @@ def _wait_health(url: str, expected: dict, timeout: float = 180.0) -> dict:
                         f"{url} {key}={health.get(key)!r}, expected {expected[key]!r}"
                     )
             if health.get("ready") is True:
-                return health
+                return _verify_live(url, expected, health)
         time.sleep(2.0)
     raise TimeoutError(f"timed out waiting for {url}/health")
 
@@ -81,8 +109,26 @@ def _manifest(bundle: Path) -> dict:
     )
     if ancestry.returncode != 0:
         raise ValueError(f"service HEAD does not contain compatibility commit {commit}")
+    # Rehydrate persisted artifacts and resolve registry/permutation without loading weights.
+    from deploy.arx_calibrated_http import validate_model_contract
+    from tau0_vla.adapters.arx_lift2s.deploy_io import build_native_action_perm
+    from tau0_vla.data import action_slices, load_data_spec
+
+    spec = load_data_spec(bundle, route=manifest["route"])
+    saved = validate_model_contract(spec)
+    if manifest.get("deployment_contract") != saved or manifest.get("robot_name") != spec.robot_name:
+        raise ValueError("deployment manifest disagrees with persisted Data Spec")
+    if spec.finch_config_name != manifest["route"]:
+        raise ValueError("deployment manifest route disagrees with persisted Data Spec")
+    permutation = build_native_action_perm(action_slices(spec))
+    if permutation is None or sorted(permutation) != list(range(14)):
+        raise ValueError("ARX native action permutation must cover all 14 channels")
+    model_config = json.loads((bundle / "config.json").read_text(encoding="utf-8"))
+    if model_config.get("training_time_rtc", False):
+        raise ValueError("calibrated/feedback deployment requires RTC disabled")
     manifest["model_dir"] = str(bundle)
     manifest["checkpoint_sha256"] = manifest["model_sha256"]
+    manifest["protocol_version"] = saved["protocol_version"]
     return manifest
 
 
@@ -153,18 +199,17 @@ def _live_config() -> dict | None:
         "#{pane_pid}",
         capture=True,
     )
-    pid = int(result.stdout.strip().splitlines()[0])
-    command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-    args = [value.decode() for value in command if value]
-
-    def option(name: str) -> str:
-        return args[args.index(name) + 1]
-
-    return {
-        "model_dir": option("--model"),
-        "model_id": option("--model-id"),
-        "checkpoint_sha256": option("--checkpoint-sha256"),
-    }
+    try:
+        pid = int(result.stdout.strip().splitlines()[0])
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        args = [value.decode() for value in command if value]
+        model_dir = args[args.index("--model") + 1]
+        config = _manifest(Path(model_dir))
+        _verify_live(PRODUCTION_URL, config)
+    except (OSError, ValueError, IndexError, RuntimeError, subprocess.CalledProcessError):
+        return None
+    config["verified_live_at"] = datetime.now(timezone.utc).isoformat()
+    return config
 
 
 def prepare(bundle: Path) -> None:
@@ -172,39 +217,43 @@ def prepare(bundle: Path) -> None:
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
 
-def candidate(bundle: Path) -> None:
+def candidate(bundle: Path, startup_timeout: float = 600.0) -> None:
     manifest = _manifest(bundle)
     _stop(CANDIDATE_SESSION)
-    _start(manifest, candidate=True)
-    health = _wait_health(CANDIDATE_URL, manifest)
+    try:
+        _start(manifest, candidate=True)
+        health = _wait_health(CANDIDATE_URL, manifest, timeout=startup_timeout)
+    except Exception:
+        _stop(CANDIDATE_SESSION)
+        raise
     print(json.dumps(health, indent=2, sort_keys=True))
 
 
-def promote(bundle: Path) -> None:
+def promote(bundle: Path, startup_timeout: float = 600.0) -> None:
     manifest = _manifest(bundle)
-    candidate_health = _health(CANDIDATE_URL)
-    if candidate_health is None:
-        raise RuntimeError("candidate is not healthy; run candidate first")
-    for key in ("model_id", "checkpoint_sha256"):
-        if candidate_health.get(key) != manifest[key]:
-            raise RuntimeError("candidate identity does not match requested bundle")
+    _verify_live(CANDIDATE_URL, manifest)
     previous = _live_config()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if previous is not None:
         (STATE_DIR / "previous.json").write_text(
             json.dumps(previous, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+    else:
+        # Never recover from a leftover state file when nothing was verified live.
+        (STATE_DIR / "previous.json").unlink(missing_ok=True)
     _stop(CANDIDATE_SESSION)
     _stop(PRODUCTION_SESSION)
     time.sleep(2.0)
     try:
         _start(manifest, candidate=False)
-        health = _wait_health(PRODUCTION_URL, manifest)
+        health = _wait_health(PRODUCTION_URL, manifest, timeout=startup_timeout)
     except Exception:
         _stop(PRODUCTION_SESSION)
         if previous is not None:
             _start(previous, candidate=False)
-            _wait_health(PRODUCTION_URL, previous)
+            _wait_health(PRODUCTION_URL, previous, timeout=startup_timeout)
+        else:
+            (STATE_DIR / "active.json").unlink(missing_ok=True)
         raise
     (STATE_DIR / "active.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -212,16 +261,29 @@ def promote(bundle: Path) -> None:
     print(json.dumps(health, indent=2, sort_keys=True))
 
 
-def rollback() -> None:
+def rollback(startup_timeout: float = 600.0) -> None:
     path = STATE_DIR / "previous.json"
     if not path.is_file():
         raise FileNotFoundError(f"no rollback state: {path}")
     previous = json.loads(path.read_text(encoding="utf-8"))
+    if not previous.get("verified_live_at"):
+        raise ValueError("rollback state was not captured from a verified live service")
+    verified = _manifest(Path(previous["model_dir"]))
+    for key in ("model_id", "checkpoint_sha256", "route", "protocol_version"):
+        if previous.get(key) != verified[key]:
+            raise ValueError(f"rollback bundle has changed: {key}")
     _stop(CANDIDATE_SESSION)
     _stop(PRODUCTION_SESSION)
     time.sleep(2.0)
-    _start(previous, candidate=False)
-    print(json.dumps(_wait_health(PRODUCTION_URL, previous), indent=2, sort_keys=True))
+    try:
+        _start(verified, candidate=False)
+        health = _wait_health(PRODUCTION_URL, verified, timeout=startup_timeout)
+    except Exception:
+        _stop(PRODUCTION_SESSION)
+        (STATE_DIR / "active.json").unlink(missing_ok=True)
+        raise
+    (STATE_DIR / "active.json").write_text(json.dumps(verified, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(health, indent=2, sort_keys=True))
 
 
 def status() -> None:
@@ -239,13 +301,17 @@ def parse_args():
     for name in ("prepare", "candidate", "promote"):
         command = sub.add_parser(name)
         command.add_argument("bundle", type=Path)
-    sub.add_parser("rollback")
+        if name != "prepare":
+            command.add_argument("--startup-timeout", type=float, default=600.0)
+    sub.add_parser("rollback").add_argument("--startup-timeout", type=float, default=600.0)
     sub.add_parser("status")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     arguments = parse_args()
-    globals()[arguments.command](**(
-        {"bundle": arguments.bundle} if hasattr(arguments, "bundle") else {}
-    ))
+    options = vars(arguments).copy()
+    command = options.pop("command")
+    if "startup_timeout" in options and options["startup_timeout"] <= 0:
+        raise ValueError("startup timeout must be positive")
+    globals()[command](**options)

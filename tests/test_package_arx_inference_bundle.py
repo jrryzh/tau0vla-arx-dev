@@ -53,6 +53,8 @@ def test_package_is_self_contained_and_excludes_training_state(tmp_path):
         task_instruction="pick blue",
         repo_root=ROOT,
         link_model=True,
+        source_checkpoint="/inspire/original/run/checkpoint-30000",
+        source_run="/inspire/original/run",
     ))
     assert result == output
     assert (output / "finch_data_spec" / route / "spec.json").is_file()
@@ -62,6 +64,13 @@ def test_package_is_self_contained_and_excludes_training_state(tmp_path):
     assert manifest["training_git_dirty"] is True
     assert manifest["deployment_kind"] == "inference-only"
     assert manifest["model_storage"] == "hardlink"
+    assert manifest["source_checkpoint"] == "/inspire/original/run/checkpoint-30000"
+    assert manifest["source_checkpoint_name"] == "checkpoint-30000"
+    assert manifest["source_run"] == "/inspire/original/run"
+    assert manifest["training_git_commit"] == "training"
+    for line in (output / "SHA256SUMS").read_text().splitlines():
+        digest, name = line.split("  ", 1)
+        assert digest == MODULE._sha256(output / name)
     assert (output / "model.safetensors").stat().st_ino == (checkpoint / "model.safetensors").stat().st_ino
     assert "optimizer.pt" in manifest["excluded_training_state"]
     with pytest.raises(FileExistsError):

@@ -298,6 +298,13 @@ def test_feedback_v4_sessioned_http_omits_eef_and_preserves_recording(tmp_path):
                 "sample_monotonic_ns": 1,
                 "raw_joint_feedback": [0.0] * 14,
             }
+            for field in ("request_id", "sample_monotonic_ns"):
+                for invalid in (True, 1.5, "1", 0, -1):
+                    rejected = await client.post(
+                        f"/arx/v4/sessions/{session_id}/action-chunks",
+                        data={"metadata": json.dumps({**request, field: invalid})}, files=files,
+                    )
+                    assert rejected.status_code == 422
             response = await client.post(
                 f"/arx/v4/sessions/{session_id}/action-chunks",
                 data={"metadata": json.dumps(request)},
@@ -312,6 +319,12 @@ def test_feedback_v4_sessioned_http_omits_eef_and_preserves_recording(tmp_path):
                 "arm_action": 1,
                 "gripper_action": 1,
             }
+            for invalid_id in (1, 3):
+                rejected = await client.post(
+                    f"/arx/v4/sessions/{session_id}/action-chunks",
+                    data={"metadata": json.dumps({**request, "request_id": invalid_id})}, files=files,
+                )
+                assert rejected.status_code == 409
         recordings = list(tmp_path.rglob("request-*.npz"))
         assert len(recordings) == 1
         with np.load(recordings[0], allow_pickle=False) as recording:
