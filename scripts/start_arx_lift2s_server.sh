@@ -3,6 +3,9 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script_path="${repo_root}/scripts/$(basename "${BASH_SOURCE[0]}")"
+# The shared Python environment may be editable-installed from another checkout.
+# Resolve all serving code from this isolated deployment worktree.
+export PYTHONPATH="${repo_root}/src:${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
 : "${MODEL_DIR:=/home/xiangchengliu/models/tau0vla-arx-pickplace-h200-step10000}"
 : "${PYTHON_BIN:=/home/xiangchengliu/anaconda3/envs/tau0-vla/bin/python}"
 : "${BIND_HOST:=192.168.50.2}"
