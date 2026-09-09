@@ -343,3 +343,68 @@ def test_constant_gripper_normalization_is_finite():
     out = assembler({"_state_raw": np.zeros(14), "_action_raw": np.zeros((30,14)), "images":{}, "prompt":""})
     assert np.isfinite(out["action"]).all() and np.isfinite(out["state"]).all()
     np.testing.assert_array_equal(out["action"][:,18:20],0)
+
+
+@pytest.mark.parametrize("feedback_v4", (False, True))
+def test_recording_runs_after_response_and_failure_closes_health(tmp_path, monkeypatch, feedback_v4):
+    """A background write failure must be visible before any subsequent inference."""
+    import asyncio
+    from io import BytesIO
+
+    import httpx
+    from PIL import Image
+
+    spec = spec_for(tmp_path, "joint-feedback")
+    protocol, version, prefix = PROTOCOL, VERSION, "/arx/v3"
+    if feedback_v4:
+        spec.robot_cls = ArxFeedbackJoint
+        spec.robot_name = spec.unified_registry_key = FEEDBACK_BODY
+        spec.deployment_contract = feedback_contract()
+        spec.action_semantics = feedback_contract()["action_semantics"]
+        protocol, version, prefix = FEEDBACK_PROTOCOL, FEEDBACK_VERSION, "/arx/v4"
+    inference_calls = []
+    def infer(payload):
+        inference_calls.append(payload)
+        return {"actions": np.zeros((30, 14), dtype=np.float32)}
+    app = build_calibrated_app(
+        SimpleNamespace(data_spec=spec, rtc_enabled=False, infer=infer),
+        model_id="recording-failure-test", record_dir=tmp_path,
+    )
+    response_sent = []
+    write_after_response = []
+    async def observed_app(scope, receive, send):
+        async def observed_send(message):
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                response_sent.append(scope["path"])
+            await send(message)
+        await app(scope, receive, observed_send)
+    def failed_write(*args, **kwargs):
+        write_after_response.append(any(path.endswith("/action-chunks") for path in response_sent))
+        raise OSError("simulated disk full")
+    monkeypatch.setattr(np, "savez_compressed", failed_write)
+    image = BytesIO()
+    Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(image, format="JPEG")
+    files = {name: (name + ".jpg", image.getvalue(), "image/jpeg") for name in ("head", "left_wrist", "right_wrist")}
+    async def check():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=observed_app), base_url="http://test") as client:
+            created = await client.post(prefix + "/sessions", json={
+                "protocol_version": protocol, "calibration_version": version,
+                "client_adapter_version": "arx-calibrated-client-v1", "experiment": "joint-feedback",
+                "task_instruction": "pick", "client_name": "test", "robot_id": "synthetic",
+                "calibration_id": "synthetic", "open_baselines": {"left": -3.3, "right": -3.3},
+            })
+            endpoint = f"{prefix}/sessions/{created.json()['session_id']}/action-chunks"
+            request = {"protocol_version": protocol, "request_id": 1, "sample_monotonic_ns": 1,
+                       "raw_joint_feedback": [0.] * 14}
+            if not feedback_v4:
+                request["raw_eef_feedback"] = [0.] * 14
+            response = await client.post(endpoint, data={"metadata": json.dumps(request)}, files=files)
+            assert response.status_code == 200
+            assert write_after_response == [True]
+            health = (await client.get("/health")).json()
+            assert health["ready"] is False
+            assert "simulated disk full" in health["recording_error"]
+            rejected = await client.post(endpoint, data={"metadata": json.dumps({**request, "request_id": 2})}, files=files)
+            assert rejected.status_code == 503
+            assert len(inference_calls) == 1
+    asyncio.run(check())
